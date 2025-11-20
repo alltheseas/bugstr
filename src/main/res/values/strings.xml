@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="bugstr_crash_report_found">Crash report ready</string>
+    <string name="bugstr_crash_report_message">Would you like to send the recent crash report to %1$s in an ephemeral DM? Personal information is never included.</string>
+    <string name="bugstr_crash_report_send">Send</string>
+    <string name="bugstr_crash_report_dismiss">Dismiss</string>
+</resources>
