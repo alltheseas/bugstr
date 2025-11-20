@@ -20,26 +20,32 @@
  */
 package com.bugstr
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
+import android.util.Log
+import kotlinx.coroutines.runBlocking
 
 /**
  * Installs as the process-wide crash handler and serializes interesting crashes via Bugstr.
  */
 class BugstrCrashHandler(
     private val cache: BugstrCrashReportCache,
-    private val scope: CoroutineScope,
     private val assembler: BugstrReportAssembler,
     private val delegate: Thread.UncaughtExceptionHandler? = Thread.getDefaultUncaughtExceptionHandler(),
     private val shouldStore: (Throwable) -> Boolean = { it !is OutOfMemoryError },
 ) : Thread.UncaughtExceptionHandler {
+    companion object {
+        private const val TAG = "BugstrCrashHandler"
+    }
+
     override fun uncaughtException(
         t: Thread,
         e: Throwable,
     ) {
         if (shouldStore(e)) {
-            scope.launch {
-                cache.writeReport(assembler.buildReport(e))
+            // Blocks the crashing thread just long enough to flush the stack trace to disk.
+            runBlocking {
+                cache
+                    .writeReport(assembler.buildReport(e))
+                    .onFailure { Log.w(TAG, "Failed to persist Bugstr report", it) }
             }
         }
         delegate?.uncaughtException(t, e)
