@@ -1,6 +1,6 @@
 # Bugstr
 
-<img width="512" height="512" alt="bugstr" src="https://github.com/user-attachments/assets/142f5f0e-5c12-40a7-b8fa-88c26b859809" />
+<img width="256" height="256" alt="bugstr" src="https://github.com/user-attachments/assets/142f5f0e-5c12-40a7-b8fa-88c26b859809" />
 
 Bugstr packages the crash reporting flow that Amethyst uses to prompt users to share stack traces with developers over expiring (NIP-17) direct messages. It is designed to be re-used by other Nostr apps—or any Android app that wants an opt-in crash reporter that keeps the user in control of what is sent.
 
