@@ -29,68 +29,84 @@ class BugstrReportAssembler(
     private val appName: String? = null,
     private val appVersionName: String = "0.0.0",
     private val buildVariant: String = "RELEASE",
+    private val maxStackCharacters: Int = 200_000,
 ) {
-    fun buildReport(e: Throwable): String =
-        buildString {
-            appendLine(appName ?: "Bugstr Report")
-            append(e.javaClass.simpleName)
-            append(": ")
-            appendLine("$appVersionName-${buildVariant.uppercase()}")
-            appendLine()
+    /**
+     * Builds a markdown friendly crash report that includes device metadata and stack traces.
+     */
+    fun buildReport(e: Throwable): String {
+        val builder =
+            buildString {
+                appendLine(appName ?: "Bugstr Report")
+                append(e.javaClass.simpleName)
+                append(": ")
+                appendLine("$appVersionName-${buildVariant.uppercase()}")
+                appendLine()
 
-            appendLine("| Prop | Value |")
-            appendLine("|------|-------|")
-            append("| Manuf |")
-            append(Build.MANUFACTURER)
-            appendLine(" |")
-            append("| Model |")
-            append(Build.MODEL)
-            appendLine(" |")
-            append("| Prod |")
-            append(Build.PRODUCT)
-            appendLine(" |")
+                appendLine("| Prop | Value |")
+                appendLine("|------|-------|")
+                append("| Manuf |")
+                append(Build.MANUFACTURER)
+                appendLine(" |")
+                append("| Model |")
+                append(Build.MODEL)
+                appendLine(" |")
+                append("| Prod |")
+                append(Build.PRODUCT)
+                appendLine(" |")
 
-            append("| Android |")
-            append(Build.VERSION.RELEASE)
-            appendLine(" |")
-            append("| SDK Int |")
-            append(Build.VERSION.SDK_INT.toString())
-            appendLine(" |")
+                append("| Android |")
+                append(Build.VERSION.RELEASE)
+                appendLine(" |")
+                append("| SDK Int |")
+                append(Build.VERSION.SDK_INT.toString())
+                appendLine(" |")
 
-            append("| Brand |")
-            append(Build.BRAND)
-            appendLine(" |")
-            append("| Hardware |")
-            append(Build.HARDWARE)
-            appendLine(" |")
+                append("| Brand |")
+                append(Build.BRAND)
+                appendLine(" |")
+                append("| Hardware |")
+                append(Build.HARDWARE)
+                appendLine(" |")
 
-            append("| Device | ")
-            append(Build.DEVICE)
-            appendLine(" |")
-            append("| Host | ")
-            append(Build.HOST)
-            appendLine(" |")
-            append("| User | ")
-            append(Build.USER)
-            appendLine(" |")
-            appendLine()
+                append("| Device | ")
+                append(Build.DEVICE)
+                appendLine(" |")
+                appendLine()
 
-            appendLine("```")
-            appendLine(e.toString())
-            e.stackTrace.forEach {
-                append("    ")
-                appendLine(it.toString())
+                appendLine("```")
+                appendThrowable(e, indent = 0, visited = mutableSetOf())
+                appendLine("```")
             }
-            val cause = e.cause
-            if (cause != null) {
-                appendLine("\n\nCause:")
-                append("    ")
-                appendLine(cause.toString())
-                cause.stackTrace.forEach {
-                    append("        ")
-                    appendLine(it.toString())
-                }
-            }
-            appendLine("```")
+
+        return if (builder.length <= maxStackCharacters) {
+            builder
+        } else {
+            builder.substring(0, maxStackCharacters) + "\n\n... Bugstr truncated the stack trace ..."
         }
+    }
+
+    private fun StringBuilder.appendThrowable(
+        throwable: Throwable,
+        indent: Int,
+        visited: MutableSet<Throwable>,
+    ) {
+        if (!visited.add(throwable)) {
+            append("    ".repeat(indent))
+            appendLine("[cycle detected: ${throwable::class.java.simpleName}]")
+            return
+        }
+
+        append("    ".repeat(indent))
+        appendLine(throwable.toString())
+        throwable.stackTrace.forEach {
+            append("    ".repeat(indent + 1))
+            appendLine(it.toString())
+        }
+        throwable.cause?.let { cause ->
+            append("    ".repeat(indent))
+            appendLine("Caused by:")
+            appendThrowable(cause, indent + 1, visited)
+        }
+    }
 }
