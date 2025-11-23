@@ -45,6 +45,9 @@ class Nip17PayloadBuilderTest {
         assertEquals(13, wrap.seal.kind)
         assertEquals(1059, wrap.giftWrap.kind)
 
+        assertEquals("sender-priv-key", wrap.sealSignerPrivateKeyHex)
+        assertTrue(wrap.giftWrapPrivateKeyHex.startsWith("deadbeef"))
+
         val expirationTags = wrap.giftWrap.tags.filter { it.firstOrNull() == "expiration" }
         assertEquals("60", expirationTags.single().getOrNull(1))
 

@@ -99,7 +99,9 @@ enum class Nip17MessageKind {
 
 data class Nip17GiftWrap(
     val rumor: UnsignedNostrEvent,
+    val sealSignerPrivateKeyHex: String,
     val seal: UnsignedNostrEvent,
+    val giftWrapPrivateKeyHex: String,
     val giftWrap: UnsignedNostrEvent,
 )
 
@@ -166,7 +168,13 @@ class Nip59GiftWrapper(
                     ),
             )
 
-        return Nip17GiftWrap(rumor = rumor, seal = seal, giftWrap = giftWrap)
+        return Nip17GiftWrap(
+            rumor = rumor,
+            sealSignerPrivateKeyHex = senderPrivateKeyHex,
+            seal = seal,
+            giftWrapPrivateKeyHex = giftWrapPrivateKey,
+            giftWrap = giftWrap,
+        )
     }
 }
 
