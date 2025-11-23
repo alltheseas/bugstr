@@ -26,6 +26,7 @@ class Nip17PayloadBuilder(
             "Plaintext exceeds $MAX_NIP44_PAYLOAD characters."
         }
         require(request.senderPrivateKeyHex.isNotBlank()) { "Sender private key is required." }
+        require(request.senderPubKey.isNotBlank()) { "Sender pubkey is required." }
 
         val rumor = buildRumor(request)
         val createdAt = timestampRandomizer.randomize(Instant.now().epochSecond)
@@ -43,6 +44,11 @@ class Nip17PayloadBuilder(
     }
 
     private fun buildRumor(request: Nip17Request): UnsignedNostrEvent {
+        require(request.senderPubKey.isNotBlank()) { "Rumor pubkey is required." }
+        if (request.messageKind == Nip17MessageKind.File) {
+            requireNotNull(request.fileMetadata) { "File metadata required for file messages." }
+        }
+
         val tags = mutableListOf<List<String>>()
         request.recipients.forEach { recipient ->
             val tag = buildList(2 + if (recipient.relayHint != null) 1 else 0) {
@@ -57,6 +63,21 @@ class Nip17PayloadBuilder(
         }
         request.subject?.let { subject ->
             tags += listOf("subject", subject)
+        }
+        if (request.messageKind == Nip17MessageKind.File) {
+            request.fileMetadata?.let { meta ->
+                tags += listOf("file-type", meta.mimeType)
+                meta.encryptionAlgorithm?.let { tags += listOf("encryption-algorithm", it) }
+                meta.decryptionKey?.let { tags += listOf("decryption-key", it) }
+                meta.decryptionNonce?.let { tags += listOf("decryption-nonce", it) }
+                meta.sha256?.let { tags += listOf("x", it) }
+                meta.originalSha256?.let { tags += listOf("ox", it) }
+                meta.sizeBytes?.let { tags += listOf("size", it.toString()) }
+                meta.dimensions?.let { tags += listOf("dim", it) }
+                meta.blurhash?.let { tags += listOf("blurhash", it) }
+                meta.thumbnailUrl?.let { tags += listOf("thumb", it) }
+                meta.fallbackUrls.forEach { url -> tags += listOf("fallback", url) }
+            }
         }
 
         val kind =
@@ -85,6 +106,7 @@ data class Nip17Request(
     val replyRelayHint: String? = null,
     val subject: String? = null,
     val messageKind: Nip17MessageKind = Nip17MessageKind.Chat,
+    val fileMetadata: Nip17FileMetadata? = null,
 )
 
 data class Nip17Recipient(
@@ -96,6 +118,20 @@ enum class Nip17MessageKind {
     Chat,
     File,
 }
+
+data class Nip17FileMetadata(
+    val mimeType: String,
+    val encryptionAlgorithm: String? = null,
+    val decryptionKey: String? = null,
+    val decryptionNonce: String? = null,
+    val sha256: String? = null,
+    val originalSha256: String? = null,
+    val sizeBytes: Long? = null,
+    val dimensions: String? = null,
+    val blurhash: String? = null,
+    val thumbnailUrl: String? = null,
+    val fallbackUrls: List<String> = emptyList(),
+)
 
 data class Nip17GiftWrap(
     val rumor: UnsignedNostrEvent,
@@ -122,6 +158,7 @@ class Nip59GiftWrapper(
         expirationSeconds: Long?,
         createdAt: Long,
     ): Nip17GiftWrap {
+        require(rumor.pubKey == senderPubKey) { "Seal pubkey must match sender." }
         val sealCreatedAt = timestampRandomizer.randomize(createdAt)
         val giftCreatedAt = timestampRandomizer.randomize(createdAt)
 
