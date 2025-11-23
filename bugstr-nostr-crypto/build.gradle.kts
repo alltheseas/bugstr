@@ -12,7 +12,6 @@ java {
 }
 
 repositories {
-    google()
     mavenCentral()
 }
 
