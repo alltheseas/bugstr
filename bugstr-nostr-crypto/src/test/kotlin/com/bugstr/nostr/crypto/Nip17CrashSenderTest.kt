@@ -3,16 +3,7 @@ package com.bugstr.nostr.crypto
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-
-private class FakeEncryptor : Nip44Encryptor {
-    override fun encrypt(senderPrivateKeyHex: String, receiverPubKeyHex: String, plaintext: String): String {
-        return "enc:${senderPrivateKeyHex.take(6)}:${receiverPubKeyHex.take(6)}:$plaintext"
-    }
-}
-
-private class FakePubKeyDeriver : PubKeyDeriver {
-    override fun derivePubKeyHex(privateKeyHex: String): String = "pub${privateKeyHex.takeLast(6)}"
-}
+import kotlinx.coroutines.runBlocking
 
 private class FakeSigner : NostrEventSigner {
     override fun sign(event: UnsignedNostrEvent, privateKeyHex: String): Result<SignedNostrEvent> =
@@ -46,12 +37,12 @@ class Nip17CrashSenderTest {
                 Nip17PayloadBuilder(
                     giftWrapper =
                         Nip59GiftWrapper(
-                            nip44Encryptor = FakeEncryptor(),
-                            pubKeyDeriver = FakePubKeyDeriver(),
-                            randomSource = DeterministicRandom(),
-                            timestampRandomizer = TimestampRandomizer(randomSource = DeterministicRandom()),
+                            nip44Encryptor = TestFakeEncryptor(),
+                            pubKeyDeriver = TestFakePubKeyDeriver(),
+                            randomSource = TestDeterministicRandom(),
+                            timestampRandomizer = TimestampRandomizer(randomSource = TestDeterministicRandom()),
                         ),
-                    timestampRandomizer = TimestampRandomizer(randomSource = DeterministicRandom()),
+                    timestampRandomizer = TimestampRandomizer(randomSource = TestDeterministicRandom()),
                 ),
             signer = FakeSigner(),
             publisher = publisher,
@@ -67,7 +58,7 @@ class Nip17CrashSenderTest {
                 plaintext = "hi",
             )
 
-        val result = sender.send(request)
+        val result = runBlocking { sender.send(request) }
         assertTrue(result.isSuccess)
 
         assertEquals(1, publisher.published.size)
@@ -77,19 +68,5 @@ class Nip17CrashSenderTest {
         assertEquals("sig-sender", sent.seal.sig.take(10))
         assertEquals(1059, sent.giftWrap.kind)
         assertTrue(sent.giftWrap.sig.startsWith("sig-dead"))
-    }
-}
-
-private class DeterministicRandom : RandomSource() {
-    private var counter = 0L
-
-    override fun randomSeconds(maxSeconds: Long): Long {
-        counter += 1
-        return counter
-    }
-
-    override fun randomPrivateKeyHex(): String {
-        counter += 1
-        return "deadbeef${counter}"
     }
 }

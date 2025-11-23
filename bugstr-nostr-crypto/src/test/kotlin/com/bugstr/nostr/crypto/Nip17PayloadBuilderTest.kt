@@ -4,29 +4,19 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-private class FakeEncryptor : Nip44Encryptor {
-    override fun encrypt(senderPrivateKeyHex: String, receiverPubKeyHex: String, plaintext: String): String {
-        return "enc:${senderPrivateKeyHex.take(6)}:${receiverPubKeyHex.take(6)}:$plaintext"
-    }
-}
-
-private class FakePubKeyDeriver : PubKeyDeriver {
-    override fun derivePubKeyHex(privateKeyHex: String): String = "pub${privateKeyHex.takeLast(6)}"
-}
-
 class Nip17PayloadBuilderTest {
-    private val encryptor = FakeEncryptor()
-    private val pubKeyDeriver = FakePubKeyDeriver()
+    private val encryptor = TestFakeEncryptor()
+    private val pubKeyDeriver = TestFakePubKeyDeriver()
     private val giftWrapper = Nip59GiftWrapper(
         nip44Encryptor = encryptor,
         pubKeyDeriver = pubKeyDeriver,
-        randomSource = DeterministicRandom(),
-        timestampRandomizer = TimestampRandomizer(randomSource = DeterministicRandom()),
+        randomSource = TestDeterministicRandom(),
+        timestampRandomizer = TimestampRandomizer(randomSource = TestDeterministicRandom()),
     )
 
     @Test
     fun buildGiftWraps_includesExpirationAndRelayHints() {
-        val builder = Nip17PayloadBuilder(giftWrapper = giftWrapper, timestampRandomizer = TimestampRandomizer(DeterministicRandom()))
+        val builder = Nip17PayloadBuilder(giftWrapper = giftWrapper, timestampRandomizer = TimestampRandomizer(TestDeterministicRandom()))
         val request =
             Nip17Request(
                 senderPubKey = "sender-pub",
@@ -57,19 +47,5 @@ class Nip17PayloadBuilderTest {
 
         assertTrue(wrap.seal.content.startsWith("enc:"))
         assertTrue(wrap.giftWrap.content.startsWith("enc:"))
-    }
-}
-
-private class DeterministicRandom : RandomSource() {
-    private var counter = 0L
-
-    override fun randomSeconds(maxSeconds: Long): Long {
-        counter += 1
-        return counter
-    }
-
-    override fun randomPrivateKeyHex(): String {
-        counter += 1
-        return "deadbeef${counter}"
     }
 }
