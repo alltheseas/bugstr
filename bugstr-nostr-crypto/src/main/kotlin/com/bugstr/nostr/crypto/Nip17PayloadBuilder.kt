@@ -145,8 +145,8 @@ data class Nip17GiftWrap(
  * Helper that creates seals and gift wraps from a rumor using NIP-59 rules.
  */
 class Nip59GiftWrapper(
-    private val nip44Encryptor: Nip44Encryptor,
-    private val pubKeyDeriver: PubKeyDeriver,
+    private val nip44Encryptor: Nip44Encryptor = QuartzNip44Encryptor(),
+    private val pubKeyDeriver: PubKeyDeriver = QuartzPubKeyDeriver(),
     private val randomSource: RandomSource = RandomSource(),
     private val timestampRandomizer: TimestampRandomizer = TimestampRandomizer(),
 ) {
