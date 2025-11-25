@@ -4,7 +4,9 @@ Bugstr packages the crash reporting flow that [Amethyst](https://github.com/vito
 
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/1c3c17dc-6a6d-4881-9ac7-32217bd4e1ad" />
 
+### Supported Platforms
 
+Android/Kotlin ✅
 
 ## Components
 
