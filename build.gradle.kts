@@ -1,16 +1,16 @@
 plugins {
-    id("com.android.library") version "8.10.1"
-    id("org.jetbrains.kotlin.android") version "2.2.0"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.2.0"
+    id("com.android.library") version "8.13.1"
+    id("org.jetbrains.kotlin.android") version "2.2.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.2.21"
 }
 
 android {
     namespace = "com.bugstr"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
@@ -28,11 +28,12 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "21"
+        freeCompilerArgs += "-Xstring-concat=inline"
     }
 
     buildFeatures {
@@ -45,7 +46,7 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2025.06.01")
+    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 

@@ -20,7 +20,6 @@
  */
 package com.bugstr.ui
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -57,13 +56,12 @@ private sealed interface CrashUiState {
     data object Empty : CrashUiState
 
     data class Ready(
-        val reports: List<String>,
-        val totalCount: Int,
+        val report: String,
     ) : CrashUiState
 
     data class Error(
         val throwable: Throwable?,
-        val pendingReports: List<String>?,
+        val pendingReport: String?,
     ) : CrashUiState
 }
 
@@ -93,13 +91,11 @@ fun BugstrCrashPrompt(
     }
 
     LaunchedEffect(cache, loadSequence) {
-        val result = cache.loadAllAndDelete()
+        val result = cache.loadAndDelete()
         state =
             result.fold(
-                onSuccess = { reports ->
-                    if (reports.isEmpty()) CrashUiState.Empty else CrashUiState.Ready(reports, reports.size)
-                },
-                onFailure = { throwable -> CrashUiState.Error(throwable, null) },
+                onSuccess = { report -> report?.let { CrashUiState.Ready(it) } ?: CrashUiState.Empty },
+                onFailure = { CrashUiState.Error(it, null) },
             )
     }
 
@@ -137,11 +133,11 @@ fun BugstrCrashPrompt(
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            if (current.pendingReports == null) {
+                            if (current.pendingReport != null) {
+                                state = CrashUiState.Ready(current.pendingReport)
+                            } else {
                                 refreshFromDisk()
-                                return@TextButton
                             }
-                            state = CrashUiState.Ready(current.pendingReports, current.pendingReports.size)
                         },
                     ) {
                         Text(retryButtonText ?: stringResource(id = R.string.bugstr_crash_report_retry))
@@ -149,27 +145,14 @@ fun BugstrCrashPrompt(
                 },
             )
         is CrashUiState.Ready -> {
-            val report = current.reports.firstOrNull()
-            if (report == null) {
-                state = CrashUiState.Empty
-                return@BugstrCrashPrompt
-            }
-
-            val position = current.totalCount - current.reports.size + 1
-            val remaining = current.reports.drop(1)
-
+            val report = current.report
             AlertDialog(
                 modifier = modifier,
                 onDismissRequest = {},
                 title = { Text(titleText ?: stringResource(id = R.string.bugstr_crash_report_found)) },
                 text = {
-                    Column {
-                        SelectionContainer {
-                            Text(descriptionText ?: stringResource(id = R.string.bugstr_crash_report_message, developerName))
-                        }
-                        if (current.totalCount > 1) {
-                            Text(stringResource(id = R.string.bugstr_crash_report_counter, position, current.totalCount))
-                        }
+                    SelectionContainer {
+                        Text(descriptionText ?: stringResource(id = R.string.bugstr_crash_report_message, developerName))
                     }
                 },
                 dismissButton = {
@@ -178,21 +161,8 @@ fun BugstrCrashPrompt(
                             scope.launch {
                                 cache
                                     .writeReport(report)
-                                    .onSuccess {
-                                        if (remaining.isEmpty()) {
-                                            state = CrashUiState.Empty
-                                            return@launch
-                                        }
-                                        val result =
-                                            remaining.foldIndexed(Result.success(Unit)) { index, acc, entry ->
-                                                if (acc.isFailure) return@foldIndexed acc
-                                                cache.writeReport(entry, slotKey = "queued_$index")
-                                            }
-                                        result
-                                            .onSuccess { state = CrashUiState.Empty }
-                                            .onFailure { error -> state = CrashUiState.Error(error, remaining) }
-                                    }
-                                    .onFailure { throwable -> state = CrashUiState.Error(throwable, current.reports) }
+                                    .onSuccess { state = CrashUiState.Empty }
+                                    .onFailure { state = CrashUiState.Error(it, report) }
                             }
                         },
                     ) {
@@ -204,14 +174,8 @@ fun BugstrCrashPrompt(
                         contentPadding = PaddingValues(horizontal = 16.dp),
                         onClick = {
                             runCatching { onSendReport(report) }
-                                .onSuccess {
-                                    if (remaining.isEmpty()) {
-                                        state = CrashUiState.Empty
-                                        return@onSuccess
-                                    }
-                                    state = CrashUiState.Ready(remaining, current.totalCount)
-                                }
-                                .onFailure { throwable -> state = CrashUiState.Error(throwable, current.reports) }
+                                .onSuccess { state = CrashUiState.Empty }
+                                .onFailure { throwable -> state = CrashUiState.Error(throwable, report) }
                         },
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {

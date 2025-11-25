@@ -9,5 +9,4 @@
     <string name="bugstr_crash_report_error">We could not access the crash report. %1$s</string>
     <string name="bugstr_crash_report_retry">Try again</string>
     <string name="bugstr_crash_report_keep">Keep for later</string>
-    <string name="bugstr_crash_report_counter">Report %1$d of %2$d</string>
 </resources>

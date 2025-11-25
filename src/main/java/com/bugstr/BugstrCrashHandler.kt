@@ -22,7 +22,6 @@ package com.bugstr
 
 import android.util.Log
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Installs as the process-wide crash handler and serializes interesting crashes via Bugstr.
@@ -32,8 +31,6 @@ class BugstrCrashHandler(
     private val assembler: BugstrReportAssembler,
     private val delegate: Thread.UncaughtExceptionHandler? = Thread.getDefaultUncaughtExceptionHandler(),
     private val shouldStore: (Throwable) -> Boolean = { it !is OutOfMemoryError },
-    private val writeTimeoutMs: Long = 1_000,
-    private val attachmentsProvider: () -> Map<String, String> = { emptyMap() },
 ) : Thread.UncaughtExceptionHandler {
     companion object {
         private const val TAG = "BugstrCrashHandler"
@@ -43,26 +40,14 @@ class BugstrCrashHandler(
         t: Thread,
         e: Throwable,
     ) {
-        if (!shouldStore(e)) {
-            delegate?.uncaughtException(t, e)
-            return
-        }
-
-        val report =
-            runCatching { assembler.buildReport(e, attachmentsProvider()) }
-                .getOrElse { assembler.buildReport(e) }
-
-        val result =
+        if (shouldStore(e)) {
             // Blocks the crashing thread just long enough to flush the stack trace to disk.
             runBlocking {
-                withTimeoutOrNull(writeTimeoutMs) {
-                    cache.writeReport(report)
-                } ?: runCatching { error("Bugstr write timed out after ${writeTimeoutMs}ms") }
+                cache
+                    .writeReport(assembler.buildReport(e))
+                    .onFailure { Log.w(TAG, "Failed to persist Bugstr report", it) }
             }
-
-        result
-            ?.onFailure { Log.w(TAG, "Bugstr did not complete write before crash propagation", it) }
-
+        }
         delegate?.uncaughtException(t, e)
     }
 

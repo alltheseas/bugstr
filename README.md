@@ -10,16 +10,15 @@ Bugstr packages the crash reporting flow that [Amethyst](https://github.com/vito
 
 Bugstr ships three small building blocks:
 
-1. `BugstrCrashReportCache` stores crash stack traces on disk. It defaults to one slot; set `maxReports` or a custom `slotKey` for multi-slot rotation. All disk I/O is suspend and runs on `Dispatchers.IO`.
-2. `BugstrCrashHandler` installs an `UncaughtExceptionHandler`, accepts an attachments provider, and blocks the crashing thread with a bounded timeout while flushing to disk.
-3. `BugstrCrashPrompt` is a Jetpack Compose dialog that surfaces all cached reports (newest first) and lets the user send, keep, or dismiss them.
-4. `BugstrAnrWatcher` (optional) can write a synthetic report when the main thread stalls.
+1. `BugstrCrashReportCache` stores the most recent crash stack trace on disk (one report at a time), exposes suspend APIs that run on `Dispatchers.IO`, and lets you customize the backing filename if you want multiple slots.
+2. `BugstrCrashHandler` installs an `UncaughtExceptionHandler` that serializes crashes via `BugstrReportAssembler` and blocks the crashing thread until the report is flushed.
+3. `BugstrCrashPrompt` is a Jetpack Compose dialog that gives the user the option to send the cached report anywhere you like.
 
 ## Installing the crash handler
 
 ```kotlin
 class MyApp : Application() {
-    private val bugstrCache by lazy { BugstrCrashReportCache(this, maxReports = 3) }
+    private val bugstrCache by lazy { BugstrCrashReportCache(this) }
     private val bugstrHandler by lazy {
         BugstrCrashHandler(
             cache = bugstrCache,
@@ -28,8 +27,6 @@ class MyApp : Application() {
                 appVersionName = BuildConfig.VERSION_NAME,
                 buildVariant = BuildConfig.FLAVOR.ifBlank { "release" },
             ),
-            attachmentsProvider = { mapOf("recent logs" to fetchRecentLogs()) },
-            writeTimeoutMs = 1_000,
         )
     }
 
@@ -42,32 +39,9 @@ class MyApp : Application() {
 
 This mirrors the way Amethyst keeps the default handler and only writes non-OOM crashes to disk.
 
-### Optional ANR watcher
-
-If you also want ANR coverage, wire up `BugstrAnrWatcher`:
-
-```kotlin
-private val anrWatcher by lazy {
-    BugstrAnrWatcher(
-        cache = bugstrCache,
-        assembler = BugstrReportAssembler(
-            appName = "My App",
-            appVersionName = BuildConfig.VERSION_NAME,
-            buildVariant = BuildConfig.FLAVOR.ifBlank { "release" },
-        )
-    )
-}
-
-override fun onCreate() {
-    super.onCreate()
-    bugstrHandler.installAsDefault()
-    anrWatcher.start()
-}
-```
-
 ## Showing the prompt
 
-In any Compose screen you can drop `BugstrCrashPrompt` and wire up the `onSendReport` callback to your own navigation or DM composer. Bugstr will load and delete the cached crash reports on the first composition.
+In any Compose screen you can drop `BugstrCrashPrompt` and wire up the `onSendReport` callback to your own navigation or DM composer. Bugstr will load and delete the cached crash report on the first composition.
 
 ```kotlin
 @Composable
@@ -101,7 +75,6 @@ In this example the `expiresDays` flag is what turns the DM composer into a NIP-
 ## Notes
 
 - Bugstr avoids reading or sending anything automatically. Users stay in control and can inspect/edit the crash report before sharing.
-- You can store multiple crashes by setting `maxReports` or providing a slot key when writing. The prompt iterates through everything it finds.
-- `BugstrCrashPrompt` offers a “Keep for later” button that rewrites remaining reports to disk instead of discarding them.
+- Only a single crash report is cached at a time. If you need durability for multiple crashes, provide your own queue by swapping the `fileName` argument in `BugstrCrashReportCache` per slot.
+- `BugstrCrashPrompt` offers a “Keep for later” button that rewrites the report to disk instead of discarding it.
 - `BugstrReportAssembler` recurses through the entire `Throwable` cause chain, trims overly large traces (default 200k characters), and intentionally omits `Build.HOST`/`Build.USER` to keep ROM build metadata out of the report. Tune `maxStackCharacters` if needed.
-- Attachments are supported via the crash handler’s `attachmentsProvider`. They render under their own headings and are truncated for safety.
