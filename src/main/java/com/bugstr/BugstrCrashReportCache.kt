@@ -25,39 +25,77 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.FileInputStream
 import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.InputStreamReader
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val STACK_TRACE_FILENAME = "bugstr.stack.trace"
+private const val PREFS_NAME = "bugstr.cache.prefs"
+private const val PREF_NEXT_SLOT = "next_slot"
 
 /**
- * Simple helper that keeps the most recent crash report in private app storage.
- * Consumers may customize the backing file via [fileName] if they want a queue of reports.
- * The data is removed as soon as UI code reads it to keep state tidy across launches.
+ * Simple helper that keeps crash reports in private app storage.
+ * Defaults to one-slot storage; set [maxReports] > 1 to rotate a small queue.
+ * Data is removed as soon as UI code reads it to keep state tidy across launches.
  */
 class BugstrCrashReportCache(
     private val appContext: Context,
     private val fileName: String = STACK_TRACE_FILENAME,
+    private val maxReports: Int = 1,
 ) {
-    private fun outputStream() = appContext.openFileOutput(fileName, Context.MODE_PRIVATE)
+    init {
+        require(maxReports >= 1) { "maxReports must be at least 1" }
+    }
 
-    private fun deleteReport() = appContext.deleteFile(fileName)
+    private val prefs by lazy {
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
 
-    private fun inputStreamOrNull(): FileInputStream? =
+    private val nextSlot = AtomicInteger(prefs.getInt(PREF_NEXT_SLOT, 0))
+
+    private fun outputStream(target: String): FileOutputStream =
+        appContext.openFileOutput(target, Context.MODE_PRIVATE)
+
+    private fun deleteReport(target: String) {
+        appContext.deleteFile(target)
+    }
+
+    private fun inputStreamOrNull(target: String): FileInputStream? =
         try {
-            appContext.openFileInput(fileName)
+            appContext.openFileInput(target)
         } catch (_: FileNotFoundException) {
             null
         }
+
+    private fun rotateSlot(): String {
+        if (maxReports == 1) return fileName
+        val slot = nextSlot.getAndUpdate { (it + 1) % maxReports }
+        prefs.edit().putInt(PREF_NEXT_SLOT, (slot + 1) % maxReports).apply()
+        return "$fileName.$slot"
+    }
+
+    private fun resolveFile(slotKey: String?): String {
+        if (slotKey != null) return "$fileName.$slotKey"
+        return rotateSlot()
+    }
+
+    private fun reportFiles(): List<java.io.File> {
+        val dir = appContext.filesDir ?: return emptyList()
+        val matches = dir.listFiles { _, name -> name.startsWith(fileName) } ?: return emptyList()
+        if (matches.isEmpty()) return emptyList()
+        return matches.sortedByDescending { it.lastModified() }
+    }
 
     /**
      * Persists the formatted stack trace for later retrieval.
      * Suspends on Dispatchers.IO to guarantee the write happens off the main thread.
      * Returns a [Result] so callers can log/propagate failures without crashing the app again.
      */
-    suspend fun writeReport(report: String): Result<Unit> =
+    suspend fun writeReport(report: String, slotKey: String? = null): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                outputStream().use { stream ->
+                val target = resolveFile(slotKey)
+                outputStream(target).use { stream ->
                     stream.write(report.toByteArray(Charsets.UTF_8))
                 }
             }
@@ -68,18 +106,31 @@ class BugstrCrashReportCache(
      * The file is only deleted if the read succeeds to avoid losing unreadable data.
      */
     suspend fun loadAndDelete(): Result<String?> =
+        loadAllAndDelete().map { it.firstOrNull() }
+
+    /**
+     * Returns all persisted reports (newest first) and wipes them after a successful read.
+     * If any read fails, nothing is deleted to avoid losing data.
+     */
+    suspend fun loadAllAndDelete(): Result<List<String>> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val stack =
-                    inputStreamOrNull()?.use { inStream ->
-                        InputStreamReader(inStream, Charsets.UTF_8).use { reader ->
-                            reader.readText()
+                val files = reportFiles()
+                if (files.isEmpty()) return@runCatching emptyList<String>()
+
+                val reports =
+                    files.map { file ->
+                        inputStreamOrNull(file.name)?.use { inStream ->
+                            InputStreamReader(inStream, Charsets.UTF_8).use { reader ->
+                                reader.readText()
+                            }
                         }
                     }
-                if (stack != null) {
-                    runCatching { deleteReport() }
-                }
-                stack
+
+                if (reports.any { it == null }) error("Failed to read one or more Bugstr reports")
+
+                files.forEach { deleteReport(it.name) }
+                reports.filterNotNull()
             }
         }
 }
