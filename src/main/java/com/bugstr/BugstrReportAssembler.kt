@@ -30,11 +30,15 @@ class BugstrReportAssembler(
     private val appVersionName: String = "0.0.0",
     private val buildVariant: String = "RELEASE",
     private val maxStackCharacters: Int = 200_000,
+    private val maxAttachmentCharacters: Int = 50_000,
 ) {
     /**
      * Builds a markdown friendly crash report that includes device metadata and stack traces.
      */
-    fun buildReport(e: Throwable): String {
+    fun buildReport(
+        e: Throwable,
+        attachments: Map<String, String> = emptyMap(),
+    ): String {
         val builder =
             buildString {
                 appendLine(appName ?: "Bugstr Report")
@@ -73,6 +77,18 @@ class BugstrReportAssembler(
                 append(Build.DEVICE)
                 appendLine(" |")
                 appendLine()
+
+                if (attachments.isNotEmpty()) {
+                    appendLine("Attachments")
+                    attachments.forEach { (key, value) ->
+                        val safeKey = key.ifBlank { "attachment" }
+                        appendLine("### $safeKey")
+                        appendLine("```")
+                        appendLine(value.take(maxAttachmentCharacters))
+                        appendLine("```")
+                    }
+                    appendLine()
+                }
 
                 appendLine("```")
                 appendThrowable(e, indent = 0, visited = mutableSetOf())
