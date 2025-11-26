@@ -7,6 +7,7 @@ Bugstr packages the crash reporting flow that [Amethyst](https://github.com/vito
 ### Supported Platforms
 
 Android/Kotlin ✅
+Typescript - https://github.com/alltheseas/Bugstr-TS
 
 ## Components
 
