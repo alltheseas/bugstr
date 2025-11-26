@@ -1,5 +1,7 @@
 # Bugstr
 
+🚧 ```Proceed with caution: Bugstr Android is proof of concept stage, and has not been reviewed by a professional developer``` 🚧
+
 Bugstr packages the crash reporting flow that [Amethyst](https://github.com/vitorpamplona/amethyst) uses to prompt users to share stack traces with developers over expiring ([NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md)) direct messages. Bugstr includes [Quartz](https://github.com/vitorpamplona/quartz), or Android SDK via Amethyst. It is designed to be re-used by other Nostr apps—or any Android app that wants an opt-in crash reporter that keeps the user in control of what is sent.
 
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/1c3c17dc-6a6d-4881-9ac7-32217bd4e1ad" />
