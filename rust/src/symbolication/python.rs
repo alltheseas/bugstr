@@ -57,7 +57,8 @@ impl<'a> PythonSymbolicator<'a> {
         let file_re = Regex::new(
             r#"^\s*File\s+"([^"]+)",\s+line\s+(\d+),\s+in\s+(.+)$"#
         ).unwrap();
-        let exception_re = Regex::new(r"^([A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)?):?\s*(.*)$").unwrap();
+        // Exception line must end with Error, Exception, or Warning to avoid matching "Traceback"
+        let exception_re = Regex::new(r"^([A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)):?\s*(.*)$").unwrap();
 
         let mut frames = Vec::new();
         let mut in_frame = false;

@@ -55,11 +55,13 @@ impl<'a> JavaScriptSymbolicator<'a> {
         // Chrome/V8 style: "    at functionName (file.js:line:col)"
         // Firefox style: "functionName@file.js:line:col"
         // Node.js style: "    at functionName (file.js:line:col)"
+        // Note: File paths can contain colons (URLs, Windows paths), so we match
+        // greedily up to the last :line:col pattern
         let chrome_re = Regex::new(
-            r"^\s*at\s+(?:(.+?)\s+)?\(?([^:]+):(\d+):(\d+)\)?"
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(.+):(\d+):(\d+)\)?"
         ).unwrap();
         let firefox_re = Regex::new(
-            r"^(.+?)@([^:]+):(\d+):(\d+)"
+            r"^(.+?)@(.+):(\d+):(\d+)$"
         ).unwrap();
 
         for line in stack_trace.lines() {
@@ -128,7 +130,7 @@ mod tests {
     #[test]
     fn test_parse_chrome_stack_frame() {
         let chrome_re = Regex::new(
-            r"^\s*at\s+(?:(.+?)\s+)?\(?([^:]+):(\d+):(\d+)\)?"
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(.+):(\d+):(\d+)\)?"
         ).unwrap();
 
         let frame = "    at myFunction (bundle.js:1:2345)";
@@ -141,8 +143,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chrome_stack_frame_with_url() {
+        let chrome_re = Regex::new(
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(.+):(\d+):(\d+)\)?"
+        ).unwrap();
+
+        let frame = "    at myFunction (http://localhost:8080/bundle.js:1:2345)";
+        let caps = chrome_re.captures(frame).unwrap();
+
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("myFunction"));
+        assert_eq!(caps.get(2).map(|m| m.as_str()), Some("http://localhost:8080/bundle.js"));
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("1"));
+        assert_eq!(caps.get(4).map(|m| m.as_str()), Some("2345"));
+    }
+
+    #[test]
     fn test_parse_firefox_stack_frame() {
-        let firefox_re = Regex::new(r"^(.+?)@([^:]+):(\d+):(\d+)").unwrap();
+        let firefox_re = Regex::new(r"^(.+?)@(.+):(\d+):(\d+)$").unwrap();
 
         let frame = "myFunction@bundle.js:1:2345";
         let caps = firefox_re.captures(frame).unwrap();

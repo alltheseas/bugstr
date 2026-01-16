@@ -63,8 +63,9 @@ impl<'a> ReactNativeSymbolicator<'a> {
         // Native Android: "    at com.example.MyClass.method(MyClass.java:42)"
         // Native iOS: "0   MyApp    0x00000001 myFunction + 123"
 
+        // Note: File paths can contain colons (URLs), so we match greedily
         let js_frame_re = Regex::new(
-            r"^\s*at\s+(?:(.+?)\s+)?\(?(?:address at\s+)?([^:]+):(\d+):(\d+)\)?"
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(?:address at\s+)?(.+):(\d+):(\d+)\)?"
         ).unwrap();
         let native_android_re = Regex::new(
             r"^\s*at\s+([a-zA-Z0-9_.]+)\.([a-zA-Z0-9_<>]+)\(([^:]+):(\d+)\)"
@@ -85,7 +86,7 @@ impl<'a> ReactNativeSymbolicator<'a> {
             // Try JS/Hermes frame
             if let Some(caps) = js_frame_re.captures(line_trimmed) {
                 let function = caps.get(1).map(|m| m.as_str());
-                let _file = caps.get(2).map(|m| m.as_str());
+                let file = caps.get(2).map(|m| m.as_str());
                 let line_num: u32 = caps
                     .get(3)
                     .and_then(|m| m.as_str().parse().ok())
@@ -122,11 +123,11 @@ impl<'a> ReactNativeSymbolicator<'a> {
                     }
                 }
 
-                // No source map or token not found
+                // No source map or token not found - preserve original file path
                 frames.push(SymbolicatedFrame {
                     raw: line.to_string(),
                     function: function.map(|s| s.to_string()),
-                    file: None,
+                    file: file.map(|s| s.to_string()),
                     line: Some(line_num),
                     column: Some(col_num),
                     symbolicated: false,
@@ -190,7 +191,7 @@ mod tests {
     #[test]
     fn test_parse_js_frame() {
         let js_frame_re = Regex::new(
-            r"^\s*at\s+(?:(.+?)\s+)?\(?(?:address at\s+)?([^:]+):(\d+):(\d+)\)?"
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(?:address at\s+)?(.+):(\d+):(\d+)\)?"
         ).unwrap();
 
         let frame = "    at myFunction (index.bundle:1:2345)";
@@ -198,6 +199,21 @@ mod tests {
 
         assert_eq!(caps.get(1).map(|m| m.as_str()), Some("myFunction"));
         assert_eq!(caps.get(2).map(|m| m.as_str()), Some("index.bundle"));
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("1"));
+        assert_eq!(caps.get(4).map(|m| m.as_str()), Some("2345"));
+    }
+
+    #[test]
+    fn test_parse_js_frame_with_url() {
+        let js_frame_re = Regex::new(
+            r"^\s*at\s+(?:(.+?)\s+)?\(?(?:address at\s+)?(.+):(\d+):(\d+)\)?"
+        ).unwrap();
+
+        let frame = "    at myFunction (http://localhost:8081/index.bundle:1:2345)";
+        let caps = js_frame_re.captures(frame).unwrap();
+
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("myFunction"));
+        assert_eq!(caps.get(2).map(|m| m.as_str()), Some("http://localhost:8081/index.bundle"));
         assert_eq!(caps.get(3).map(|m| m.as_str()), Some("1"));
         assert_eq!(caps.get(4).map(|m| m.as_str()), Some("2345"));
     }

@@ -51,7 +51,8 @@ impl<'a> GoSymbolicator<'a> {
         // main.main()
         //         /path/to/main.go:10 +0x2b
 
-        let func_re = Regex::new(r"^([a-zA-Z0-9_./*]+)\(([^)]*)\)$").unwrap();
+        // Matches function names including pointer receivers like main.(*Type).Method
+        let func_re = Regex::new(r"^([a-zA-Z0-9_./]+(?:\(\*[^)]+\))?[a-zA-Z0-9_.]*)\(([^)]*)\)$").unwrap();
         let location_re = Regex::new(r"^\s+(.+\.go):(\d+)\s+\+0x[0-9a-f]+$").unwrap();
         let goroutine_re = Regex::new(r"^goroutine\s+\d+\s+\[.+\]:$").unwrap();
 
@@ -151,6 +152,7 @@ impl<'a> GoSymbolicator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
 
     #[test]
     fn test_parse_go_stack() {
@@ -165,5 +167,23 @@ main.main()
         let result = sym.parse_go_stack(stack).unwrap();
 
         assert!(result.symbolicated_count >= 2);
+    }
+
+    #[test]
+    fn test_func_re_matches_pointer_receiver() {
+        // Matches function names including pointer receivers like main.(*Type).Method
+        let func_re = Regex::new(r"^([a-zA-Z0-9_./]+(?:\(\*[^)]+\))?[a-zA-Z0-9_.]*)\(([^)]*)\)$").unwrap();
+
+        // Regular function
+        let caps = func_re.captures("main.myFunction(0x123)").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "main.myFunction");
+
+        // Pointer receiver method
+        let caps = func_re.captures("main.(*Server).handleRequest(0x123, 0x456)").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "main.(*Server).handleRequest");
+
+        // Value receiver method
+        let caps = func_re.captures("net/http.(*Server).Serve(0x123)").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "net/http.(*Server).Serve");
     }
 }
