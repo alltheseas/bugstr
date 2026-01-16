@@ -192,6 +192,118 @@ fn show_pubkey(privkey: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Symbolicate a stack trace using mapping files.
+///
+/// Reads a stack trace from a file or stdin, symbolicates it using the appropriate
+/// platform-specific symbolicator, and outputs the result in the specified format.
+///
+/// # Parameters
+///
+/// * `platform_str` - Platform identifier string. Supported values:
+///   - `"android"` - Android (ProGuard/R8 mapping files)
+///   - `"electron"` or `"javascript"` or `"js"` - JavaScript/Electron (source maps)
+///   - `"flutter"` or `"dart"` - Flutter/Dart (symbol files)
+///   - `"rust"` - Rust (backtrace parsing)
+///   - `"go"` or `"golang"` - Go (goroutine stacks)
+///   - `"python"` - Python (traceback parsing)
+///   - `"react-native"` or `"reactnative"` or `"rn"` - React Native (Hermes + source maps)
+///   Unknown platforms trigger a warning but still attempt symbolication.
+///
+/// * `input` - Path to file containing the stack trace, or `"-"` to read from stdin.
+///   The file is read entirely into memory as UTF-8 text.
+///
+/// * `mappings_dir` - Borrowed reference to the directory containing mapping files.
+///   Expected structure: `<root>/<platform>/<app_id>/<version>/<mapping_file>`.
+///   See [`MappingStore`] for detailed directory layout.
+///
+/// * `app_id` - Optional application identifier (e.g., package name, bundle ID).
+///   Used to locate the correct mapping file. If `None`, defaults to `"unknown"`.
+///
+/// * `version` - Optional application version string (e.g., `"1.0.0"`).
+///   Used to locate the correct mapping file. If `None`, defaults to `"unknown"`.
+///   Falls back to newest available version if exact match not found.
+///
+/// * `format` - Output format selection. See [`SymbolicateFormat`]:
+///   - `Pretty` - Human-readable colored output with frame numbers and source locations
+///   - `Json` - Machine-readable JSON with full frame details
+///
+/// # Returns
+///
+/// * `Ok(())` - Symbolication completed (results printed to stdout)
+/// * `Err(_)` - One of the following errors occurred:
+///   - IO error reading input file or stdin
+///   - [`SymbolicationError::MappingNotFound`] - No mapping file for platform/app/version
+///   - [`SymbolicationError::ParseError`] - Failed to parse mapping file
+///   - [`SymbolicationError::IoError`] - Failed to read mapping file
+///   - [`SymbolicationError::UnsupportedPlatform`] - Platform::Unknown was provided
+///   - JSON serialization error (for JSON format output)
+///
+/// # Output Format
+///
+/// **Pretty format** (default):
+/// ```text
+/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Symbolication Results 5 frames symbolicated (83.3%)
+/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+///
+///   #0 com.example.MyClass.myMethod (MyClass.java:42)
+///   #1 com.example.OtherClass.call (OtherClass.java:15)
+/// ```
+///
+/// **JSON format**:
+/// ```json
+/// {
+///   "symbolicated_count": 5,
+///   "total_count": 6,
+///   "percentage": 83.33,
+///   "frames": [
+///     {
+///       "raw": "at a.b.c(Unknown:1)",
+///       "function": "com.example.MyClass.myMethod",
+///       "file": "MyClass.java",
+///       "line": 42,
+///       "column": null,
+///       "symbolicated": true
+///     }
+///   ]
+/// }
+/// ```
+///
+/// # Side Effects
+///
+/// - Reads from filesystem (input file and mapping files)
+/// - Reads from stdin if `input` is `"-"`
+/// - Writes to stdout (symbolication results)
+/// - Writes to stderr (warnings for unknown platform, missing mappings)
+/// - Creates mapping directory if it doesn't exist (via [`MappingStore::scan`])
+///
+/// # Panics
+///
+/// This function does not panic under normal operation. All errors are returned
+/// as `Result::Err`.
+///
+/// # Example
+///
+/// ```ignore
+/// // Symbolicate an Android stack trace from a file
+/// symbolicate_stack(
+///     "android",
+///     "crash.txt",
+///     &PathBuf::from("./mappings"),
+///     Some("com.myapp".to_string()),
+///     Some("1.0.0".to_string()),
+///     SymbolicateFormat::Pretty,
+/// )?;
+///
+/// // Symbolicate from stdin with JSON output
+/// symbolicate_stack(
+///     "python",
+///     "-",
+///     &PathBuf::from("./mappings"),
+///     None,
+///     None,
+///     SymbolicateFormat::Json,
+/// )?;
+/// ```
 fn symbolicate_stack(
     platform_str: &str,
     input: &str,
