@@ -8,15 +8,15 @@ BugStr is a privacy-focused crash reporting library for Nostr applications. It u
 
 ### Supported Platforms
 
-| Platform | Directory | Status |
-|----------|-----------|--------|
-| Android/Kotlin | `android/` | Production |
-| TypeScript | `typescript/` | Production |
-| Flutter/Dart | `dart/` | Library |
-| Rust | `rust/` | CLI + Library |
-| Go | `go/` | Library |
-| Python | `python/` | Library |
-| React Native | `react-native/` | Library |
+| Platform | Directory |
+|----------|-----------|
+| Android/Kotlin | `android/` |
+| TypeScript | `typescript/` |
+| Flutter/Dart | `dart/` |
+| Rust | `rust/` |
+| Go | `go/` |
+| Python | `python/` |
+| React Native | `react-native/` |
 
 ### Key NIPs
 

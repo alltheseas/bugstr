@@ -8,15 +8,15 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 
 ## Platforms
 
-| Platform | Status | Directory | Tested |
-|----------|--------|-----------|--------|
-| Android/Kotlin | Production | [`android/`](android/) | ✅ [Zapstore](https://github.com/zapstore/zapstore/pull/272) |
-| TypeScript | Production | [`typescript/`](typescript/) | 🐹 Guinea pigs needed |
-| Flutter/Dart | Library | [`dart/`](dart/) | 🐹 Guinea pigs needed |
-| Rust | CLI + Library | [`rust/`](rust/) | 🐹 Guinea pigs needed |
-| Go | Library | [`go/`](go/) | 🐹 Guinea pigs needed |
-| Python | Library | [`python/`](python/) | 🐹 Guinea pigs needed |
-| React Native | Library | [`react-native/`](react-native/) | 🐹 Guinea pigs needed |
+| Platform | Directory | Tested |
+|----------|-----------|--------|
+| Android/Kotlin | [`android/`](android/) | ✅ [Zapstore](https://github.com/zapstore/zapstore/pull/272) |
+| TypeScript | [`typescript/`](typescript/) | 🐹 Guinea pigs needed |
+| Flutter/Dart | [`dart/`](dart/) | 🐹 Guinea pigs needed |
+| Rust | [`rust/`](rust/) | 🐹 Guinea pigs needed |
+| Go | [`go/`](go/) | 🐹 Guinea pigs needed |
+| Python | [`python/`](python/) | 🐹 Guinea pigs needed |
+| React Native | [`react-native/`](react-native/) | 🐹 Guinea pigs needed |
 
 ## How It Works
 
