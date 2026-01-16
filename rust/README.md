@@ -97,6 +97,72 @@ let json = event.to_json();
 
 Rumors include `id` (computed) and `sig: ""` (empty string) per spec.
 
+## Symbolication
+
+Bugstr supports server-side symbolication of stack traces using mapping files (ProGuard, source maps, etc.).
+
+### Enable Symbolication
+
+```bash
+# Start server with mappings directory
+bugstr serve --privkey $BUGSTR_PRIVKEY --mappings ./mappings
+
+# Or via CLI
+bugstr symbolicate --mappings ./mappings --platform android --app com.example.app --version 1.0.0 < stacktrace.txt
+```
+
+### Directory Structure
+
+Mapping files are organized by platform, app ID, and version:
+
+```text
+mappings/
+  android/
+    com.example.app/
+      1.0.0/
+        mapping.txt          # ProGuard/R8 mapping
+      1.1.0/
+        mapping.txt
+  electron/
+    my-desktop-app/
+      1.0.0/
+        main.js.map          # Source map
+        renderer.js.map
+  flutter/
+    com.example.app/
+      1.0.0/
+        app.android-arm64.symbols
+  react-native/
+    com.example.app/
+      1.0.0/
+        index.android.bundle.map
+```
+
+### Supported Platforms
+
+| Platform | Mapping File | Notes |
+|----------|-------------|-------|
+| Android | `mapping.txt` | ProGuard/R8 obfuscation mapping |
+| Electron/JS | `*.js.map` | Source maps |
+| Flutter | `*.symbols` | Flutter symbolize format |
+| React Native | `*.bundle.map` | Hermes bytecode + JS source maps |
+| Rust | — | Parses native backtraces |
+| Go | — | Parses goroutine stacks |
+| Python | — | Parses tracebacks |
+
+### API Endpoint
+
+```bash
+curl -X POST http://localhost:3000/api/symbolicate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "android",
+    "app_id": "com.example.app",
+    "version": "1.0.0",
+    "stack_trace": "..."
+  }'
+```
+
 ## Other Platforms
 
 - [Android/Kotlin](../android/)
