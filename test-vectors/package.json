@@ -9,5 +9,8 @@
   },
   "dependencies": {
     "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "@nostrability/schemata": "github:nostrability/schemata"
   }
 }

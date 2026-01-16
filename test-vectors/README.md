@@ -6,6 +6,11 @@ Shared NIP-17 compliance test vectors for all Bugstr implementations.
 
 Uses JSON Schema draft-07 for validation, based on the [nostrability/schemata](https://github.com/nostrability/schemata) specifications.
 
+The validation script uses a flattened inline schema derived from:
+- [`nips/nip-17/kind-14/schema.yaml`](https://github.com/nostrability/schemata/blob/master/nips/nip-17/kind-14/schema.yaml)
+
+Reference implementation: [hzrd149/applesauce#39](https://github.com/hzrd149/applesauce/pull/39)
+
 ## Running Tests
 
 ```bash
