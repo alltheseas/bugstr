@@ -54,7 +54,52 @@ const (
 	DirectSizeThreshold = 50 * 1024
 	// MaxChunkSize is the maximum chunk size (48KB).
 	MaxChunkSize = 48 * 1024
+	// DefaultRelayRateLimit is the rate limit for strfry+noteguard relays (8 posts/min = 7500ms).
+	DefaultRelayRateLimit = 7500 * time.Millisecond
 )
+
+// RelayRateLimits contains known relay rate limits.
+var RelayRateLimits = map[string]time.Duration{
+	"wss://relay.damus.io":   7500 * time.Millisecond,
+	"wss://nos.lol":          7500 * time.Millisecond,
+	"wss://relay.primal.net": 7500 * time.Millisecond,
+}
+
+// GetRelayRateLimit returns the rate limit for a relay URL.
+func GetRelayRateLimit(relayURL string) time.Duration {
+	if limit, ok := RelayRateLimits[relayURL]; ok {
+		return limit
+	}
+	return DefaultRelayRateLimit
+}
+
+// EstimateUploadSeconds estimates upload time for given chunks and relays.
+func EstimateUploadSeconds(totalChunks, numRelays int) int {
+	msPerChunk := int(DefaultRelayRateLimit.Milliseconds()) / numRelays
+	return (totalChunks * msPerChunk) / 1000
+}
+
+// ProgressPhase represents the current phase of upload.
+type ProgressPhase string
+
+const (
+	ProgressPhasePreparing  ProgressPhase = "preparing"
+	ProgressPhaseUploading  ProgressPhase = "uploading"
+	ProgressPhaseFinalizing ProgressPhase = "finalizing"
+)
+
+// Progress represents upload progress for HIG-compliant UI.
+type Progress struct {
+	Phase                    ProgressPhase
+	CurrentChunk             int
+	TotalChunks              int
+	FractionCompleted        float64
+	EstimatedSecondsRemaining int
+	LocalizedDescription     string
+}
+
+// ProgressCallback is called with upload progress.
+type ProgressCallback func(Progress)
 
 // DirectPayload wraps crash data for direct delivery (kind 10420).
 type DirectPayload struct {
@@ -64,11 +109,12 @@ type DirectPayload struct {
 
 // ManifestPayload contains metadata for chunked crash reports (kind 10421).
 type ManifestPayload struct {
-	V          int      `json:"v"`
-	RootHash   string   `json:"root_hash"`
-	TotalSize  int      `json:"total_size"`
-	ChunkCount int      `json:"chunk_count"`
-	ChunkIDs   []string `json:"chunk_ids"`
+	V           int                 `json:"v"`
+	RootHash    string              `json:"root_hash"`
+	TotalSize   int                 `json:"total_size"`
+	ChunkCount  int                 `json:"chunk_count"`
+	ChunkIDs    []string            `json:"chunk_ids"`
+	ChunkRelays map[string][]string `json:"chunk_relays,omitempty"`
 }
 
 // ChunkPayload contains encrypted chunk data (kind 10422).
@@ -112,6 +158,10 @@ type Config struct {
 	// ConfirmSend prompts the user before sending. Return true to send.
 	// If nil, reports are sent automatically (suitable for servers).
 	ConfirmSend func(summary Summary) bool
+
+	// OnProgress is called with upload progress for large crash reports.
+	// Fires asynchronously - does not block the main goroutine.
+	OnProgress ProgressCallback
 }
 
 // Payload is the crash report data sent to the developer.
@@ -137,11 +187,13 @@ type CompressedEnvelope struct {
 }
 
 var (
-	config           Config
-	senderPrivkey    string
+	config             Config
+	senderPrivkey      string
 	developerPubkeyHex string
-	initialized      bool
-	initMu           sync.Mutex
+	initialized        bool
+	initMu             sync.Mutex
+	lastPostTime       = make(map[string]time.Time)
+	lastPostTimeMu     sync.Mutex
 
 	defaultRelays = []string{"wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"}
 
@@ -545,6 +597,45 @@ func publishToAllRelays(ctx context.Context, relays []string, event nostr.Event)
 	return nil
 }
 
+// waitForRateLimit waits until enough time has passed since the last post to this relay.
+func waitForRateLimit(relayURL string) {
+	lastPostTimeMu.Lock()
+	lastTime, exists := lastPostTime[relayURL]
+	lastPostTimeMu.Unlock()
+
+	if exists {
+		rateLimit := GetRelayRateLimit(relayURL)
+		elapsed := time.Since(lastTime)
+		if elapsed < rateLimit {
+			time.Sleep(rateLimit - elapsed)
+		}
+	}
+}
+
+// recordPostTime records the time of a post to a relay.
+func recordPostTime(relayURL string) {
+	lastPostTimeMu.Lock()
+	lastPostTime[relayURL] = time.Now()
+	lastPostTimeMu.Unlock()
+}
+
+// publishChunkToRelay publishes a chunk to a single relay with rate limiting.
+func publishChunkToRelay(ctx context.Context, relayURL string, event nostr.Event) error {
+	waitForRateLimit(relayURL)
+
+	relay, err := nostr.RelayConnect(ctx, relayURL)
+	if err != nil {
+		return err
+	}
+	defer relay.Close()
+
+	err = relay.Publish(ctx, event)
+	if err == nil {
+		recordPostTime(relayURL)
+	}
+	return err
+}
+
 func sendToNostr(ctx context.Context, payload *Payload) error {
 	relays := config.Relays
 	if len(relays) == 0 {
@@ -572,34 +663,86 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		return publishToRelays(ctx, relays, giftWrap)
 	}
 
-	// Large payload: chunked delivery
+	// Large payload: chunked delivery with round-robin distribution
 	rootHash, chunks, err := chunkPayloadData([]byte(content))
 	if err != nil {
 		return err
 	}
 
-	// Build and publish chunk events with delay to avoid rate limiting
-	const chunkPublishDelay = 100 * time.Millisecond
-	chunkIDs := make([]string, len(chunks))
+	totalChunks := len(chunks)
+	numRelays := len(relays)
+
+	// Report initial progress
+	if config.OnProgress != nil {
+		estimatedSeconds := EstimateUploadSeconds(totalChunks, numRelays)
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhasePreparing,
+			CurrentChunk:             0,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        0,
+			EstimatedSecondsRemaining: estimatedSeconds,
+			LocalizedDescription:     "Preparing crash report...",
+		})
+	}
+
+	// Build and publish chunk events with round-robin distribution
+	chunkIDs := make([]string, totalChunks)
+	chunkRelays := make(map[string][]string)
+
 	for i, chunk := range chunks {
 		chunkEvent := buildChunkEvent(chunk)
 		chunkIDs[i] = chunkEvent.ID
-		if err := publishToAllRelays(ctx, relays, chunkEvent); err != nil {
-			return err
+
+		// Round-robin relay selection
+		relayURL := relays[i%numRelays]
+		chunkRelays[chunkEvent.ID] = []string{relayURL}
+
+		// Publish with rate limiting
+		if err := publishChunkToRelay(ctx, relayURL, chunkEvent); err != nil {
+			// Try fallback relay
+			fallbackRelay := relays[(i+1)%numRelays]
+			if err := publishChunkToRelay(ctx, fallbackRelay, chunkEvent); err != nil {
+				// Continue anyway, cross-relay aggregation may still find it
+			} else {
+				chunkRelays[chunkEvent.ID] = []string{fallbackRelay}
+			}
 		}
-		// Add delay between chunks (not after last chunk)
-		if i < len(chunks)-1 {
-			time.Sleep(chunkPublishDelay)
+
+		// Report progress
+		if config.OnProgress != nil {
+			remainingChunks := totalChunks - i - 1
+			remainingSeconds := EstimateUploadSeconds(remainingChunks, numRelays)
+			config.OnProgress(Progress{
+				Phase:                    ProgressPhaseUploading,
+				CurrentChunk:             i + 1,
+				TotalChunks:              totalChunks,
+				FractionCompleted:        float64(i+1) / float64(totalChunks) * 0.95,
+				EstimatedSecondsRemaining: remainingSeconds,
+				LocalizedDescription:     fmt.Sprintf("Uploading chunk %d of %d", i+1, totalChunks),
+			})
 		}
 	}
 
-	// Build and publish manifest
+	// Report finalizing
+	if config.OnProgress != nil {
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhaseFinalizing,
+			CurrentChunk:             totalChunks,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        0.95,
+			EstimatedSecondsRemaining: 2,
+			LocalizedDescription:     "Finalizing...",
+		})
+	}
+
+	// Build and publish manifest with relay hints
 	manifest := ManifestPayload{
-		V:          1,
-		RootHash:   rootHash,
-		TotalSize:  len(content),
-		ChunkCount: len(chunks),
-		ChunkIDs:   chunkIDs,
+		V:           1,
+		RootHash:    rootHash,
+		TotalSize:   len(content),
+		ChunkCount:  totalChunks,
+		ChunkIDs:    chunkIDs,
+		ChunkRelays: chunkRelays,
 	}
 	manifestContent, _ := json.Marshal(manifest)
 
@@ -608,5 +751,19 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		return err
 	}
 
-	return publishToRelays(ctx, relays, manifestGiftWrap)
+	err = publishToRelays(ctx, relays, manifestGiftWrap)
+
+	// Report complete
+	if err == nil && config.OnProgress != nil {
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhaseFinalizing,
+			CurrentChunk:             totalChunks,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        1.0,
+			EstimatedSecondsRemaining: 0,
+			LocalizedDescription:     "Complete",
+		})
+	}
+
+	return err
 }

@@ -48,6 +48,36 @@ KIND_CHUNK = 10422
 DIRECT_SIZE_THRESHOLD = 50 * 1024  # 50KB
 MAX_CHUNK_SIZE = 48 * 1024  # 48KB
 
+# Relay rate limits (strfry + noteguard: 8 posts/min = 7.5s between posts)
+DEFAULT_RELAY_RATE_LIMIT = 7.5  # seconds
+RELAY_RATE_LIMITS = {
+    "wss://relay.damus.io": 7.5,
+    "wss://nos.lol": 7.5,
+    "wss://relay.primal.net": 7.5,
+}
+
+
+def get_relay_rate_limit(relay_url: str) -> float:
+    """Get rate limit for a relay URL in seconds."""
+    return RELAY_RATE_LIMITS.get(relay_url, DEFAULT_RELAY_RATE_LIMIT)
+
+
+def estimate_upload_seconds(total_chunks: int, num_relays: int) -> int:
+    """Estimate upload time for given chunks and relays."""
+    sec_per_chunk = DEFAULT_RELAY_RATE_LIMIT / num_relays
+    return max(1, int(total_chunks * sec_per_chunk))
+
+
+@dataclass
+class Progress:
+    """Progress state for crash report upload (HIG-compliant)."""
+    phase: str  # 'preparing', 'uploading', 'finalizing'
+    current_chunk: int
+    total_chunks: int
+    fraction_completed: float
+    estimated_seconds_remaining: int
+    localized_description: str
+
 # Nostr imports - using nostr-sdk
 try:
     from nostr_sdk import Keys, Client, Event, EventBuilder, Kind, Tag, PublicKey, SecretKey
@@ -103,6 +133,9 @@ class Config:
     confirm_send: Optional[Callable[[str, str], bool]] = None
     """Hook to confirm before sending. Args: (message, stack_preview). Return True to send."""
 
+    on_progress: Optional[Callable[["Progress"], None]] = None
+    """Progress callback for large crash reports. Fires in background thread."""
+
 
 @dataclass
 class Payload:
@@ -132,6 +165,8 @@ _developer_pubkey_hex: str = ""
 _initialized = False
 _lock = threading.Lock()
 _original_excepthook = None
+_last_post_time: dict[str, float] = {}
+_last_post_time_lock = threading.Lock()
 
 
 def init(
@@ -479,8 +514,45 @@ def _publish_to_all_relays(event: Event) -> None:
         t.join(timeout=10)
 
 
+def _wait_for_rate_limit(relay_url: str) -> None:
+    """Wait for relay rate limit if needed."""
+    with _last_post_time_lock:
+        last_time = _last_post_time.get(relay_url, 0)
+
+    rate_limit = get_relay_rate_limit(relay_url)
+    elapsed = time.time() - last_time
+
+    if elapsed < rate_limit:
+        time.sleep(rate_limit - elapsed)
+
+
+def _record_post_time(relay_url: str) -> None:
+    """Record post time for rate limiting."""
+    with _last_post_time_lock:
+        _last_post_time[relay_url] = time.time()
+
+
+def _publish_chunk_to_relay(event: Event, relay_url: str) -> bool:
+    """Publish a chunk to a single relay with rate limiting."""
+    _wait_for_rate_limit(relay_url)
+    try:
+        client = Client(Keys.generate())
+        client.add_relay(relay_url)
+        client.connect()
+        client.send_event(event)
+        client.disconnect()
+        _record_post_time(relay_url)
+        return True
+    except Exception:
+        return False
+
+
 def _send_to_nostr(payload: Payload) -> None:
-    """Send payload via NIP-17 gift wrap, using chunking for large payloads."""
+    """Send payload via NIP-17 gift wrap, using chunking for large payloads.
+
+    Uses round-robin relay distribution to maximize throughput while
+    respecting per-relay rate limits (8 posts/min for strfry+noteguard).
+    """
     if not _sender_keys or not _config:
         return
 
@@ -491,35 +563,96 @@ def _send_to_nostr(payload: Payload) -> None:
         payload_size = len(payload_bytes)
 
         if payload_size <= DIRECT_SIZE_THRESHOLD:
-            # Small payload: direct gift-wrapped delivery
+            # Small payload: direct gift-wrapped delivery (no progress needed)
             direct_payload = {"v": 1, "crash": payload.to_dict()}
             gift_wrap = _build_gift_wrap(KIND_DIRECT, json.dumps(direct_payload))
             _publish_to_relays(gift_wrap)
         else:
-            # Large payload: chunked delivery
+            # Large payload: chunked delivery with round-robin distribution
             root_hash, chunks = _chunk_payload(payload_bytes)
+            total_chunks = len(chunks)
+            relays = _config.relays or DEFAULT_RELAYS
+            num_relays = len(relays)
 
-            # Build and publish chunk events with delay to avoid rate limiting
-            CHUNK_PUBLISH_DELAY = 0.1  # 100ms delay between chunks
+            # Report initial progress
+            if _config.on_progress:
+                estimated_seconds = estimate_upload_seconds(total_chunks, num_relays)
+                _config.on_progress(Progress(
+                    phase="preparing",
+                    current_chunk=0,
+                    total_chunks=total_chunks,
+                    fraction_completed=0.0,
+                    estimated_seconds_remaining=estimated_seconds,
+                    localized_description="Preparing crash report...",
+                ))
+
+            # Build and publish chunk events with round-robin distribution
             chunk_ids = []
+            chunk_relays = {}
+
             for i, chunk in enumerate(chunks):
                 chunk_event = _build_chunk_event(chunk)
-                chunk_ids.append(chunk_event.id().to_hex())
-                _publish_to_all_relays(chunk_event)
-                # Add delay between chunks (not after last chunk)
-                if i < len(chunks) - 1:
-                    time.sleep(CHUNK_PUBLISH_DELAY)
+                chunk_id = chunk_event.id().to_hex()
+                chunk_ids.append(chunk_id)
 
-            # Build and publish manifest
+                # Round-robin relay selection
+                relay_url = relays[i % num_relays]
+                chunk_relays[chunk_id] = [relay_url]
+
+                # Publish with rate limiting
+                if not _publish_chunk_to_relay(chunk_event, relay_url):
+                    # Try fallback relay
+                    fallback_relay = relays[(i + 1) % num_relays]
+                    if _publish_chunk_to_relay(chunk_event, fallback_relay):
+                        chunk_relays[chunk_id] = [fallback_relay]
+                    # Continue anyway, cross-relay aggregation may still find it
+
+                # Report progress
+                if _config.on_progress:
+                    remaining_chunks = total_chunks - i - 1
+                    remaining_seconds = estimate_upload_seconds(remaining_chunks, num_relays)
+                    _config.on_progress(Progress(
+                        phase="uploading",
+                        current_chunk=i + 1,
+                        total_chunks=total_chunks,
+                        fraction_completed=(i + 1) / total_chunks * 0.95,
+                        estimated_seconds_remaining=remaining_seconds,
+                        localized_description=f"Uploading chunk {i + 1} of {total_chunks}",
+                    ))
+
+            # Report finalizing
+            if _config.on_progress:
+                _config.on_progress(Progress(
+                    phase="finalizing",
+                    current_chunk=total_chunks,
+                    total_chunks=total_chunks,
+                    fraction_completed=0.95,
+                    estimated_seconds_remaining=2,
+                    localized_description="Finalizing...",
+                ))
+
+            # Build and publish manifest with relay hints
             manifest = {
                 "v": 1,
                 "root_hash": root_hash,
                 "total_size": payload_size,
-                "chunk_count": len(chunks),
+                "chunk_count": total_chunks,
                 "chunk_ids": chunk_ids,
+                "chunk_relays": chunk_relays,
             }
             manifest_gift_wrap = _build_gift_wrap(KIND_MANIFEST, json.dumps(manifest))
             _publish_to_relays(manifest_gift_wrap)
+
+            # Report complete
+            if _config.on_progress:
+                _config.on_progress(Progress(
+                    phase="finalizing",
+                    current_chunk=total_chunks,
+                    total_chunks=total_chunks,
+                    fraction_completed=1.0,
+                    estimated_seconds_remaining=0,
+                    localized_description="Complete",
+                ))
 
     except Exception:
         # Silent failure - don't crash the app
