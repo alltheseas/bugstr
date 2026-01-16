@@ -110,19 +110,58 @@ The [`test-vectors/`](test-vectors/) directory contains JSON test cases for NIP-
 
 ## Symbolication
 
-Release builds typically use code obfuscation/minification, producing stack traces with mangled names and memory addresses instead of readable function names and line numbers.
+The Rust receiver includes built-in symbolication for 7 platforms:
 
-**Current status:** Symbolication tooling is not yet implemented. Crash reports contain raw stack traces as captured.
+| Platform | Mapping File | Notes |
+|----------|--------------|-------|
+| Android | `mapping.txt` | ProGuard/R8 with full line range support |
+| Electron/JS | `*.js.map` | Source map v3 |
+| Flutter | `*.symbols` | Via `flutter symbolize` or direct parsing |
+| Rust | Backtrace | Debug builds include source locations |
+| Go | Goroutine stacks | Symbol tables usually embedded |
+| Python | Tracebacks | Source file mapping |
+| React Native | `*.bundle.map` | Hermes bytecode + JS source maps |
 
-**Planned approach:**
-- Store mapping files (ProGuard, dSYM, sourcemaps) locally or in your CI
-- Use platform-specific tools to symbolicate:
-  - **Android**: `retrace` with ProGuard mapping
-  - **iOS/macOS**: `atos` or `symbolicatecrash` with dSYM
-  - **JavaScript**: Source map support in browser devtools
-  - **Flutter**: `flutter symbolize` with app symbols
+### CLI Usage
 
-Contributions welcome for automated symbolication in the receiver CLI/WebUI.
+```bash
+# Symbolicate a stack trace
+bugstr symbolicate --platform android --input crash.txt --mappings ./mappings \
+  --app-id com.example.app --version 1.0.0
+
+# Output formats: pretty (default) or json
+bugstr symbolicate --platform android --input crash.txt --format json
+```
+
+### Web API
+
+```bash
+# Start server with symbolication enabled
+bugstr serve --mappings ./mappings
+
+# POST to symbolicate endpoint
+curl -X POST http://localhost:3000/api/symbolicate \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"android","stack_trace":"...","app_id":"com.example","version":"1.0.0"}'
+```
+
+### Mapping File Organization
+
+```
+mappings/
+  android/
+    com.example.app/
+      1.0.0/mapping.txt
+      1.1.0/mapping.txt
+  electron/
+    my-app/
+      1.0.0/main.js.map
+  flutter/
+    com.example.app/
+      1.0.0/app.android-arm64.symbols
+```
+
+The receiver automatically falls back to the newest available version if an exact version match isn't found.
 
 ## Contributing
 
