@@ -12,7 +12,11 @@ BugStr is a privacy-focused crash reporting library for Nostr applications. It u
 |----------|-----------|--------|
 | Android/Kotlin | `android/` | Production |
 | TypeScript | `typescript/` | Production |
-| Flutter/Dart | `dart/` | Planned |
+| Flutter/Dart | `dart/` | Library |
+| Rust | `rust/` | CLI + Library |
+| Go | `go/` | Library |
+| Python | `python/` | Library |
+| React Native | `react-native/` | Library |
 
 ### Key NIPs
 
@@ -30,6 +34,9 @@ Ensure docstring coverage for any code added or modified:
 - **Kotlin**: Use KDoc format (`/** ... */`)
 - **Dart**: Use dartdoc format (`/// ...`)
 - **TypeScript**: Use JSDoc format (`/** ... */`)
+- **Rust**: Use rustdoc format (`/// ...` or `//!`)
+- **Go**: Use godoc format (comment before declaration)
+- **Python**: Use docstrings (`"""..."""`)
 
 All public classes, methods, and non-trivial functions must have documentation explaining:
 - Purpose and behavior
@@ -139,11 +146,6 @@ NIP-17 messages should be tested against multiple clients:
 bugstr/
 ├── android/                      # Android/Kotlin implementation
 │   ├── src/main/java/com/bugstr/
-│   │   ├── BugstrCrashHandler.kt
-│   │   ├── BugstrCrashReportCache.kt
-│   │   ├── BugstrReportAssembler.kt
-│   │   ├── BugstrAnrWatcher.kt
-│   │   └── ui/BugstrCrashPrompt.kt
 │   ├── bugstr-nostr-crypto/      # NIP-17/44/59 (Kotlin)
 │   ├── CHANGELOG.md
 │   └── README.md
@@ -151,7 +153,23 @@ bugstr/
 │   ├── src/
 │   ├── CHANGELOG.md
 │   └── README.md
-├── dart/                         # Flutter/Dart (planned)
+├── dart/                         # Flutter/Dart implementation
+│   ├── lib/src/
+│   ├── CHANGELOG.md
+│   └── README.md
+├── rust/                         # Rust CLI + library
+│   ├── src/
+│   ├── CHANGELOG.md
+│   └── README.md
+├── go/                           # Go library
+│   ├── bugstr.go
+│   └── README.md
+├── python/                       # Python library
+│   ├── bugstr/
+│   └── README.md
+├── react-native/                 # React Native library
+│   ├── src/
+│   └── README.md
 ├── test-vectors/                 # Shared NIP-17 compliance tests
 │   └── nip17-gift-wrap.json
 ├── AGENTS.md                     # This file (shared guidelines)

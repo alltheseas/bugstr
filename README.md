@@ -8,12 +8,15 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 
 ## Platforms
 
-| Platform | Status | Directory |
-|----------|--------|-----------|
-| Android/Kotlin | Production | [`android/`](android/) |
-| TypeScript | Production | [`typescript/`](typescript/) |
-| Flutter/Dart | Skeleton | [`dart/`](dart/) |
-| Rust | CLI + Library | [`rust/`](rust/) |
+| Platform | Status | Directory | Tested |
+|----------|--------|-----------|--------|
+| Android/Kotlin | Production | [`android/`](android/) | ✅ [Zapstore](https://github.com/zapstore/zapstore/pull/272) |
+| TypeScript | Production | [`typescript/`](typescript/) | 🐹 Guinea pigs needed |
+| Flutter/Dart | Library | [`dart/`](dart/) | 🐹 Guinea pigs needed |
+| Rust | CLI + Library | [`rust/`](rust/) | 🐹 Guinea pigs needed |
+| Go | Library | [`go/`](go/) | 🐹 Guinea pigs needed |
+| Python | Library | [`python/`](python/) | 🐹 Guinea pigs needed |
+| React Native | Library | [`react-native/`](react-native/) | 🐹 Guinea pigs needed |
 
 ## How It Works
 
@@ -26,6 +29,63 @@ Crash → Cache locally → App restart → Show consent dialog → User approve
 3. **User consent** - Dialog shows on next app launch
 4. **NIP-17 DM** - Encrypted, gift-wrapped message sent to developer
 5. **Auto-expiration** - Report deleted from relays after 30 days
+
+## Default Relays
+
+All SDKs use the same default relay list, chosen for reliability:
+
+| Relay | Max Event Size | Max WebSocket | Notes |
+|-------|----------------|---------------|-------|
+| `wss://relay.damus.io` | 64 KB | 128 KB | strfry defaults |
+| `wss://relay.primal.net` | 64 KB | 128 KB | strfry defaults |
+| `wss://nos.lol` | 128 KB | 128 KB | Fallback relay |
+
+**Note:** Most relays use strfry defaults (64 KB event size, 128 KB websocket payload). The practical limit for crash reports is ~60 KB to allow for gift-wrap envelope overhead.
+
+You can override these defaults via the `relays` configuration option in each SDK.
+
+## Size Limits & Compression
+
+Crash reports are subject to relay message size limits (see [NIP-11](https://nips.nostr.com/11) `max_message_length`).
+
+| Relay Limit | Compatibility |
+|-------------|---------------|
+| 64 KB | ~99% of relays |
+| 128 KB | ~90% of relays |
+| 512 KB+ | Major relays only |
+
+**Practical limit:** Keep compressed payloads under **60 KB** for universal delivery (allows ~500 bytes for gift-wrap envelope overhead).
+
+| Payload Size | Behavior |
+|--------------|----------|
+| < 1 KB | Sent as plain JSON |
+| ≥ 1 KB | Compressed with gzip, base64-encoded |
+
+### Compression Format
+
+Large payloads are wrapped in a versioned envelope:
+
+```json
+{
+  "v": 1,
+  "compression": "gzip",
+  "payload": "<base64-encoded-gzip-data>"
+}
+```
+
+Stack traces are automatically truncated to fit within limits (default: 200 KB before compression). The receiver CLI/WebUI automatically detects and decompresses payloads.
+
+### Compression Efficiency
+
+Gzip typically achieves **70-90% reduction** on stack traces due to their repetitive text patterns:
+
+| Original Size | Compressed | Reduction |
+|---------------|------------|-----------|
+| 10 KB | ~1-2 KB | ~80-90% |
+| 50 KB | ~5-10 KB | ~80-90% |
+| 200 KB | ~20-40 KB | ~80-85% |
+
+With gzip compression (70-90% reduction), most crash reports fit well within the 64 KB strfry default limit. For maximum compatibility, keep compressed payloads under 60 KB.
 
 ## NIP Compliance
 

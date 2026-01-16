@@ -11,9 +11,11 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # NIP-44 encryption - TBD: choose implementation
-  # nostr_tools: ^x.x.x
+  # Nostr Development Kit for NIP-44/NIP-59 support
+  ndk: ^0.6.0
+  # Local storage
   path_provider: ^2.1.0
+  # Crypto utilities
   crypto: ^3.0.3
 
 dev_dependencies:
