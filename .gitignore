@@ -21,3 +21,7 @@ node_modules/
 .env
 .env.local
 *.local
+
+# Test vectors
+test-vectors/node_modules/
+test-vectors/package-lock.json
