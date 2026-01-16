@@ -3,12 +3,26 @@
  *
  * Uses @noble/hashes and @noble/ciphers for cross-platform crypto
  * that works in React Native without native modules.
+ *
+ * **CRITICAL**: Must match hashtree-core crypto exactly:
+ * - Key derivation: HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
+ * - Cipher: AES-256-GCM with 12-byte zero nonce
+ * - Format: [ciphertext][16-byte auth tag]
  */
 import { sha256 } from '@noble/hashes/sha256';
-import { cbc } from '@noble/ciphers/aes';
-import { randomBytes } from '@noble/ciphers/webcrypto';
+import { hkdf } from '@noble/hashes/hkdf';
+import { gcm } from '@noble/ciphers/aes';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 import { MAX_CHUNK_SIZE } from './transport';
+
+/** HKDF salt for CHK derivation (must match hashtree-core) */
+const CHK_SALT = new TextEncoder().encode('hashtree-chk');
+
+/** HKDF info for key derivation (must match hashtree-core) */
+const CHK_INFO = new TextEncoder().encode('encryption-key');
+
+/** Nonce size for AES-GCM (96 bits) */
+const NONCE_SIZE = 12;
 
 export type ChunkData = {
   index: number;
@@ -23,29 +37,35 @@ export type ChunkingResult = {
 };
 
 /**
- * Encrypts data using AES-256-CBC with the given key.
- * IV is prepended to the ciphertext.
+ * Derives encryption key from content hash using HKDF-SHA256.
+ * Must match hashtree-core: HKDF(content_hash, salt="hashtree-chk", info="encryption-key")
  */
-function chkEncrypt(data: Uint8Array, key: Uint8Array): Uint8Array {
-  const iv = randomBytes(16);
-  const cipher = cbc(key, iv);
-  const encrypted = cipher.encrypt(data);
-  // Prepend IV to ciphertext
-  const result = new Uint8Array(iv.length + encrypted.length);
-  result.set(iv);
-  result.set(encrypted, iv.length);
-  return result;
+function deriveKey(contentHash: Uint8Array): Uint8Array {
+  return hkdf(sha256, contentHash, CHK_SALT, CHK_INFO, 32);
 }
 
 /**
- * Decrypts data using AES-256-CBC with the given key.
- * Expects IV prepended to the ciphertext.
+ * Encrypts data using AES-256-GCM with zero nonce (CHK-safe).
+ * Returns: [ciphertext][16-byte auth tag]
+ *
+ * Zero nonce is safe for CHK because same key = same content (convergent encryption).
  */
-function chkDecrypt(data: Uint8Array, key: Uint8Array): Uint8Array {
-  const iv = data.slice(0, 16);
-  const ciphertext = data.slice(16);
-  const cipher = cbc(key, iv);
-  return cipher.decrypt(ciphertext);
+function chkEncrypt(data: Uint8Array, contentHash: Uint8Array): Uint8Array {
+  const key = deriveKey(contentHash);
+  const zeroNonce = new Uint8Array(NONCE_SIZE); // All zeros
+  const cipher = gcm(key, zeroNonce);
+  return cipher.encrypt(data); // GCM appends auth tag
+}
+
+/**
+ * Decrypts data using AES-256-GCM with zero nonce.
+ * Expects: [ciphertext][16-byte auth tag]
+ */
+function chkDecrypt(data: Uint8Array, contentHash: Uint8Array): Uint8Array {
+  const key = deriveKey(contentHash);
+  const zeroNonce = new Uint8Array(NONCE_SIZE);
+  const cipher = gcm(key, zeroNonce);
+  return cipher.decrypt(data);
 }
 
 /**
@@ -89,8 +109,12 @@ function base64ToBytes(base64: string): Uint8Array {
 /**
  * Splits payload into chunks and encrypts each using CHK.
  *
- * Each chunk is encrypted with its own content hash as the key.
+ * Each chunk is encrypted with a key derived from its content hash via HKDF.
  * The root hash is computed by hashing all chunk hashes concatenated.
+ *
+ * **CRITICAL**: Uses hashtree-core compatible encryption:
+ * - HKDF-SHA256 key derivation with salt="hashtree-chk"
+ * - AES-256-GCM with zero nonce
  *
  * @param payload The string data to chunk and encrypt
  * @param chunkSize Maximum size of each chunk (default 48KB)
@@ -108,11 +132,11 @@ export function chunkPayload(payload: string, chunkSize = MAX_CHUNK_SIZE): Chunk
     const end = Math.min(offset + chunkSize, data.length);
     const chunkData = data.slice(offset, end);
 
-    // Compute hash of plaintext chunk (this becomes the encryption key)
+    // Compute hash of plaintext chunk (used for key derivation)
     const hash = sha256(chunkData);
     chunkHashes.push(hash);
 
-    // Encrypt chunk using its hash as the key
+    // Encrypt chunk using HKDF-derived key from hash
     const encrypted = chkEncrypt(chunkData, hash);
 
     chunks.push({
@@ -173,9 +197,9 @@ export function reassemblePayload(
   // Decrypt and concatenate chunks
   const decrypted: Uint8Array[] = [];
   for (const chunk of sorted) {
-    const key = hexToBytes(chunk.hash);
+    const contentHash = hexToBytes(chunk.hash);
     const encrypted = base64ToBytes(chunk.data);
-    const plaintext = chkDecrypt(encrypted, key);
+    const plaintext = chkDecrypt(encrypted, contentHash);
     decrypted.push(plaintext);
   }
 

@@ -17,8 +17,8 @@ dependencies:
   path_provider: ^2.1.0
   # Crypto utilities
   crypto: ^3.0.3
-  # AES encryption for CHK chunking
-  encrypt: ^5.0.3
+  # AES-GCM encryption and HKDF for CHK chunking (hashtree-core compatible)
+  pointycastle: ^3.7.4
 
 dev_dependencies:
   flutter_test:

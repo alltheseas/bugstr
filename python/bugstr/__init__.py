@@ -38,7 +38,9 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 # Transport layer constants
@@ -343,19 +345,49 @@ def _maybe_compress(plaintext: str) -> str:
     return json.dumps(envelope)
 
 
-def _chk_encrypt(data: bytes, key: bytes) -> bytes:
-    """Encrypt data using AES-256-CBC with the given key. IV is prepended."""
-    iv = secrets.token_bytes(16)
+# HKDF salt for CHK derivation (must match hashtree-core)
+CHK_SALT = b"hashtree-chk"
 
-    # PKCS7 padding
-    pad_len = 16 - len(data) % 16
-    padded = data + bytes([pad_len] * pad_len)
+# HKDF info for key derivation (must match hashtree-core)
+CHK_INFO = b"encryption-key"
 
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    encrypted = encryptor.update(padded) + encryptor.finalize()
+# Nonce size for AES-GCM (96 bits)
+NONCE_SIZE = 12
 
-    return iv + encrypted
+
+def _derive_key(content_hash: bytes) -> bytes:
+    """Derive encryption key from content hash using HKDF-SHA256.
+
+    Must match hashtree-core: HKDF(content_hash, salt="hashtree-chk", info="encryption-key")
+    """
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=CHK_SALT,
+        info=CHK_INFO,
+        backend=default_backend(),
+    )
+    return hkdf.derive(content_hash)
+
+
+def _chk_encrypt(data: bytes, content_hash: bytes) -> bytes:
+    """Encrypt data using AES-256-GCM with zero nonce (CHK-safe).
+
+    Returns: [ciphertext][16-byte auth tag]
+
+    Zero nonce is safe for CHK because same key = same content (convergent encryption).
+
+    **CRITICAL**: Must match hashtree-core crypto exactly:
+    - Key derivation: HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
+    - Cipher: AES-256-GCM with 12-byte zero nonce
+    - Format: [ciphertext][16-byte auth tag]
+    """
+    key = _derive_key(content_hash)
+    zero_nonce = bytes(NONCE_SIZE)  # All zeros
+
+    aesgcm = AESGCM(key)
+    # AESGCM.encrypt returns ciphertext with auth tag appended
+    return aesgcm.encrypt(zero_nonce, data, None)
 
 
 def _chunk_payload(data: bytes) -> tuple[str, list[dict]]:

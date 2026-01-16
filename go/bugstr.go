@@ -24,12 +24,12 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	mathrand "math/rand"
 	"regexp"
 	"runtime"
@@ -40,6 +40,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/nbd-wtf/go-nostr/nip44"
+	"golang.org/x/crypto/hkdf"
 )
 
 // Transport layer constants
@@ -369,33 +370,56 @@ func randomPastTimestamp() int64 {
 	return now - offset
 }
 
-// chkEncrypt encrypts data using AES-256-CBC with the given key.
-// IV is prepended to the ciphertext.
-func chkEncrypt(data, key []byte) ([]byte, error) {
+// HKDF salt for CHK derivation (must match hashtree-core)
+var chkSalt = []byte("hashtree-chk")
+
+// HKDF info for key derivation (must match hashtree-core)
+var chkInfo = []byte("encryption-key")
+
+// Nonce size for AES-GCM (96 bits)
+const nonceSize = 12
+
+// deriveKey derives encryption key from content hash using HKDF-SHA256.
+// Must match hashtree-core: HKDF(content_hash, salt="hashtree-chk", info="encryption-key")
+func deriveKey(contentHash []byte) ([]byte, error) {
+	hkdfReader := hkdf.New(sha256.New, contentHash, chkSalt, chkInfo)
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// chkEncrypt encrypts data using AES-256-GCM with zero nonce (CHK-safe).
+// Returns: [ciphertext][16-byte auth tag]
+//
+// Zero nonce is safe for CHK because same key = same content (convergent encryption).
+//
+// **CRITICAL**: Must match hashtree-core crypto exactly:
+// - Key derivation: HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
+// - Cipher: AES-256-GCM with 12-byte zero nonce
+// - Format: [ciphertext][16-byte auth tag]
+func chkEncrypt(data, contentHash []byte) ([]byte, error) {
+	key, err := deriveKey(contentHash)
+	if err != nil {
+		return nil, err
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 
-	// PKCS7 padding
-	padLen := aes.BlockSize - len(data)%aes.BlockSize
-	padded := make([]byte, len(data)+padLen)
-	copy(padded, data)
-	for i := len(data); i < len(padded); i++ {
-		padded[i] = byte(padLen)
-	}
-
-	iv := make([]byte, aes.BlockSize)
-	if _, err := rand.Read(iv); err != nil {
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
 		return nil, err
 	}
 
-	encrypted := make([]byte, len(iv)+len(padded))
-	copy(encrypted, iv)
-	mode := cipher.NewCBCEncrypter(block, iv)
-	mode.CryptBlocks(encrypted[aes.BlockSize:], padded)
+	// Zero nonce is safe for CHK (same key = same content)
+	zeroNonce := make([]byte, nonceSize)
 
-	return encrypted, nil
+	// GCM Seal appends auth tag to ciphertext
+	return gcm.Seal(nil, zeroNonce, data, nil), nil
 }
 
 // chunkPayloadData splits data into chunks and encrypts each using CHK.

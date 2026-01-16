@@ -125,6 +125,65 @@ id = sha256(json([0, pubkey, created_at, kind, tags, content]))
 
 Returns lowercase hex string (64 characters).
 
+## Lessons Learned
+
+### CHK Encryption Compatibility (Critical)
+
+**Problem**: All SDKs implemented CHK (Content Hash Key) encryption differently from the Rust reference implementation, causing complete decryption failure.
+
+**Root Cause**: Each SDK used its own interpretation of "encrypt with content hash":
+- Some used AES-256-CBC with random IV
+- Others omitted HKDF key derivation
+- Ciphertext format varied (IV position, tag handling)
+
+**The Correct Algorithm** (must match `hashtree-core` exactly):
+
+```
+1. content_hash = SHA256(plaintext)
+2. key = HKDF-SHA256(
+     ikm: content_hash,
+     salt: "hashtree-chk",
+     info: "encryption-key",
+     length: 32
+   )
+3. ciphertext = AES-256-GCM(
+     key: key,
+     nonce: 12 zero bytes,
+     plaintext: data
+   )
+4. output = [ciphertext][16-byte auth tag]
+```
+
+**Why each component matters**:
+
+| Component | Purpose | If Wrong |
+|-----------|---------|----------|
+| HKDF | Derives encryption key from content hash | Key mismatch → decryption fails |
+| Salt `"hashtree-chk"` | Domain separation | Different key → decryption fails |
+| Info `"encryption-key"` | Key purpose binding | Different key → decryption fails |
+| Zero nonce | Safe for CHK (same key = same content) | Different ciphertext → verification fails |
+| AES-GCM | Authenticated encryption | Different algorithm → decryption fails |
+
+**Why zero nonce is safe**: CHK is convergent encryption - the same plaintext always produces the same key. Since the key is deterministic, using a random nonce would make ciphertext non-deterministic, breaking content-addressable storage. Zero nonce is safe because the key is never reused with different content.
+
+**Verification checklist for new implementations**:
+1. Generate test vector in Rust: `cargo test chunking -- --nocapture`
+2. Encrypt same plaintext in your SDK
+3. Compare: content hash, derived key, ciphertext must be byte-identical
+4. Decrypt Rust ciphertext in your SDK (and vice versa)
+
+**Platform-specific libraries**:
+
+| Platform | HKDF | AES-GCM |
+|----------|------|---------|
+| Rust | `hashtree-core` | (built-in) |
+| Dart | `pointycastle` HKDFKeyDerivator | `pointycastle` GCMBlockCipher |
+| Kotlin | Manual HMAC-SHA256 | `javax.crypto` AES/GCM/NoPadding |
+| Go | `golang.org/x/crypto/hkdf` | `crypto/cipher` NewGCM |
+| Python | `cryptography` HKDF | `cryptography` AESGCM |
+| TypeScript (Node) | `crypto` hkdfSync | `crypto` aes-256-gcm |
+| TypeScript (RN) | `@noble/hashes/hkdf` | `@noble/ciphers/aes` gcm |
+
 ## Testing
 
 ### Unit Tests
