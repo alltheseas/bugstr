@@ -714,10 +714,11 @@ def _send_to_nostr(payload: Payload) -> None:
                 ))
 
             # Build and publish manifest with relay hints
+            # total_size is the compressed data size (what gets chunked and reassembled)
             manifest = {
                 "v": 1,
                 "root_hash": root_hash,
-                "total_size": payload_size,
+                "total_size": len(payload_bytes),
                 "chunk_count": total_chunks,
                 "chunk_ids": chunk_ids,
                 "chunk_relays": chunk_relays,

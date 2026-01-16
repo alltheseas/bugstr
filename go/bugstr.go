@@ -776,11 +776,11 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		// Publish with verification and retry (starts at round-robin relay)
 		successRelay, err := publishChunkWithVerify(ctx, relays, i%numRelays, chunkEvent)
 		if err != nil {
-			// All relays failed - this chunk is lost, but continue with others
-			// Receiver will report missing chunk
-		} else {
-			chunkRelays[chunkEvent.ID] = []string{successRelay}
+			// All relays failed for this chunk - abort to avoid partial/broken manifest
+			log.Printf("Failed to publish chunk %d/%d (id: %s): %v", i, totalChunks, chunkEvent.ID, err)
+			return fmt.Errorf("failed to publish chunk %d to any relay after retries: %w", i, err)
 		}
+		chunkRelays[chunkEvent.ID] = []string{successRelay}
 
 		// Report progress
 		if config.OnProgress != nil {

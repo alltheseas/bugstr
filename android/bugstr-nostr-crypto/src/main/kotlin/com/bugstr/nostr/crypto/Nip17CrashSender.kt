@@ -21,6 +21,10 @@ class Nip17CrashSender(
     private val signer: NostrEventSigner,
     private val publisher: NostrEventPublisher,
 ) {
+    companion object {
+        private const val TAG = "Nip17CrashSender"
+    }
+
     /** Track last post time per relay for rate limiting. */
     private val lastPostTime = mutableMapOf<String, Long>()
 
@@ -51,7 +55,8 @@ class Nip17CrashSender(
         val crashJson = try {
             JSONObject(request.plaintext)
         } catch (e: org.json.JSONException) {
-            // If plaintext is not valid JSON, wrap it as a raw string
+            // Log the exception with context, then fall back to raw string
+            android.util.Log.w(TAG, "Plaintext is not valid JSON, wrapping as raw string", e)
             JSONObject().apply { put("raw", request.plaintext) }
         }
 
@@ -182,8 +187,11 @@ class Nip17CrashSender(
             val successRelay = publishChunkWithVerify(signedChunk, relays, index % relays.size)
             if (successRelay != null) {
                 chunkRelays[signedChunk.id] = listOf(successRelay)
+            } else {
+                // All relays failed for this chunk - abort upload to avoid partial/broken manifest
+                android.util.Log.e(TAG, "Failed to publish chunk $index/$totalChunks (id: ${signedChunk.id})")
+                return Result.failure(Exception("Failed to publish chunk $index to any relay after retries"))
             }
-            // If all relays failed, chunk is lost - receiver will report missing chunk
 
             // Report progress
             val remainingChunks = totalChunks - index - 1
@@ -268,8 +276,11 @@ class Nip17CrashSender(
             put("data", chunk.data)
         }.toString()
 
+        // Derive pubKey from the actual signing key (not a random key)
+        val pubKeyHex = QuartzPubKeyDeriver().derivePubKeyHex(privateKeyHex)
+
         return UnsignedNostrEvent(
-            pubKey = RandomSource().randomPrivateKeyHex().let { QuartzPubKeyDeriver().derivePubKeyHex(it) },
+            pubKey = pubKeyHex,
             createdAt = TimestampRandomizer().randomize(java.time.Instant.now().epochSecond),
             kind = Transport.KIND_CHUNK,
             tags = emptyList(),
