@@ -40,10 +40,21 @@ import {
   DIRECT_SIZE_THRESHOLD,
   getTransportKind,
   createDirectPayload,
+  getRelayRateLimit,
+  estimateUploadSeconds,
+  progressPreparing,
+  progressUploading,
+  progressFinalizing,
+  progressCompleted,
   type ManifestPayload,
   type ChunkPayload,
+  type BugstrProgress,
+  type BugstrProgressCallback,
 } from './transport';
 import { chunkPayload, encodeChunkData, type ChunkData } from './chunking';
+
+// Re-export progress types
+export type { BugstrProgress, BugstrProgressCallback } from './transport';
 
 // Types
 export type BugstrConfig = {
@@ -56,6 +67,11 @@ export type BugstrConfig = {
   confirmSend?: (summary: BugstrSummary) => Promise<boolean> | boolean;
   /** If true, uses native Alert for confirmation. Default: true */
   useNativeAlert?: boolean;
+  /**
+   * Progress callback for large crash reports (>50KB).
+   * Fires asynchronously during upload - does not block the UI.
+   */
+  onProgress?: BugstrProgressCallback;
 };
 
 export type BugstrPayload = {
@@ -92,6 +108,9 @@ let config: BugstrConfig = {
   developerPubkey: '',
   useNativeAlert: true,
 };
+
+/** Track last post time per relay for rate limiting. */
+const lastPostTime: Map<string, number> = new Map();
 
 // Helpers
 function decodePubkey(pubkey: string): string {
@@ -262,6 +281,48 @@ async function publishToAllRelays(
   }
 }
 
+/**
+ * Wait for relay rate limit if needed.
+ */
+async function waitForRateLimit(relayUrl: string): Promise<void> {
+  const rateLimit = getRelayRateLimit(relayUrl);
+  const lastTime = lastPostTime.get(relayUrl) ?? 0;
+  const now = Date.now();
+  const elapsed = now - lastTime;
+
+  if (elapsed < rateLimit) {
+    const waitMs = rateLimit - elapsed;
+    console.log(`Bugstr: rate limit wait ${waitMs}ms for ${relayUrl}`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
+/**
+ * Record post time for rate limiting.
+ */
+function recordPostTime(relayUrl: string): void {
+  lastPostTime.set(relayUrl, Date.now());
+}
+
+/**
+ * Publish chunk to a single relay with rate limiting.
+ */
+async function publishChunkToRelay(
+  relayUrl: string,
+  event: ReturnType<typeof finalizeEvent>
+): Promise<void> {
+  await waitForRateLimit(relayUrl);
+  const relay = await Relay.connect(relayUrl);
+  await relay.publish(event);
+  relay.close();
+  recordPostTime(relayUrl);
+}
+
+/**
+ * Send payload via NIP-17 gift wrap, using chunking for large payloads.
+ * Uses round-robin relay distribution to maximize throughput while
+ * respecting per-relay rate limits (8 posts/min for strfry+noteguard).
+ */
 async function sendToNostr(payload: BugstrPayload): Promise<void> {
   if (!developerPubkeyHex || !senderPrivkey) {
     throw new Error('Bugstr Nostr keys not configured');
@@ -273,7 +334,7 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
   const transportKind = getTransportKind(payloadSize);
 
   if (transportKind === 'direct') {
-    // Small payload: direct gift-wrapped delivery
+    // Small payload: direct gift-wrapped delivery (no progress needed)
     const directPayload = createDirectPayload(payload as Record<string, unknown>);
     const giftWrap = buildGiftWrap(
       KIND_DIRECT,
@@ -285,36 +346,64 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
     await publishToRelays(relays, giftWrap);
     console.log('Bugstr: sent direct crash report');
   } else {
-    // Large payload: chunked delivery
+    // Large payload: chunked delivery with round-robin distribution
     console.log(`Bugstr: payload ${payloadSize} bytes, using chunked transport`);
 
     const { rootHash, totalSize, chunks } = chunkPayload(plaintext);
-    console.log(`Bugstr: split into ${chunks.length} chunks`);
+    const totalChunks = chunks.length;
+    console.log(`Bugstr: split into ${totalChunks} chunks across ${relays.length} relays`);
 
-    // Build chunk events
+    // Report initial progress
+    const estimatedSeconds = estimateUploadSeconds(totalChunks, relays.length);
+    config.onProgress?.(progressPreparing(totalChunks, estimatedSeconds));
+
+    // Build chunk events and track relay assignments
     const chunkEvents = chunks.map(buildChunkEvent);
-
-    // Publish chunks to all relays with delay to avoid rate limiting
     const chunkIds: string[] = [];
-    const CHUNK_PUBLISH_DELAY_MS = 100; // Delay between chunks to avoid relay rate limits
+    const chunkRelays: Record<string, string[]> = {};
+
     for (let i = 0; i < chunkEvents.length; i++) {
       const chunkEvent = chunkEvents[i];
       chunkIds.push(chunkEvent.id);
-      await publishToAllRelays(relays, chunkEvent);
-      // Add delay between chunks (not after last chunk)
-      if (i < chunkEvents.length - 1) {
-        await new Promise((resolve) => setTimeout(resolve, CHUNK_PUBLISH_DELAY_MS));
-      }
-    }
-    console.log(`Bugstr: published ${chunks.length} chunks`);
 
-    // Build and publish manifest
+      // Round-robin relay selection
+      const relayUrl = relays[i % relays.length];
+      chunkRelays[chunkEvent.id] = [relayUrl];
+
+      // Publish with rate limiting
+      try {
+        await publishChunkToRelay(relayUrl, chunkEvent);
+      } catch (err) {
+        console.log(`Bugstr: Failed to publish chunk ${i} to ${relayUrl}: ${err}`);
+        // Try fallback relay
+        const fallbackRelay = relays[(i + 1) % relays.length];
+        try {
+          await publishChunkToRelay(fallbackRelay, chunkEvent);
+          chunkRelays[chunkEvent.id] = [fallbackRelay];
+        } catch (err2) {
+          console.log(`Bugstr: Fallback also failed: ${err2}`);
+          // Continue anyway, cross-relay aggregation may still find it
+        }
+      }
+
+      // Report progress
+      const remainingChunks = totalChunks - i - 1;
+      const remainingSeconds = estimateUploadSeconds(remainingChunks, relays.length);
+      config.onProgress?.(progressUploading(i + 1, totalChunks, remainingSeconds));
+    }
+    console.log(`Bugstr: published ${totalChunks} chunks`);
+
+    // Report finalizing
+    config.onProgress?.(progressFinalizing(totalChunks));
+
+    // Build and publish manifest with relay hints
     const manifest: ManifestPayload = {
       v: 1,
       root_hash: rootHash,
       total_size: totalSize,
-      chunk_count: chunks.length,
+      chunk_count: totalChunks,
       chunk_ids: chunkIds,
+      chunk_relays: chunkRelays,
     };
 
     const manifestGiftWrap = buildGiftWrap(
@@ -326,6 +415,9 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
 
     await publishToRelays(relays, manifestGiftWrap);
     console.log('Bugstr: sent chunked crash report manifest');
+
+    // Report complete
+    config.onProgress?.(progressCompleted(totalChunks));
   }
 }
 
