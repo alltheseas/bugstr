@@ -499,12 +499,16 @@ def _send_to_nostr(payload: Payload) -> None:
             # Large payload: chunked delivery
             root_hash, chunks = _chunk_payload(payload_bytes)
 
-            # Build and publish chunk events
+            # Build and publish chunk events with delay to avoid rate limiting
+            CHUNK_PUBLISH_DELAY = 0.1  # 100ms delay between chunks
             chunk_ids = []
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 chunk_event = _build_chunk_event(chunk)
                 chunk_ids.append(chunk_event.id().to_hex())
                 _publish_to_all_relays(chunk_event)
+                # Add delay between chunks (not after last chunk)
+                if i < len(chunks) - 1:
+                    time.sleep(CHUNK_PUBLISH_DELAY)
 
             # Build and publish manifest
             manifest = {

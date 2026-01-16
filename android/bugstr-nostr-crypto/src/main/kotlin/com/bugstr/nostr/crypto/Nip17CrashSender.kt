@@ -67,9 +67,10 @@ class Nip17CrashSender(
         val payloadBytes = request.plaintext.toByteArray(Charsets.UTF_8)
         val chunkingResult = Chunking.chunkPayload(payloadBytes)
 
-        // Build and publish chunk events
+        // Build and publish chunk events with delay to avoid rate limiting
+        val chunkPublishDelayMs = 100L
         val chunkIds = mutableListOf<String>()
-        for (chunk in chunkingResult.chunks) {
+        for ((index, chunk) in chunkingResult.chunks.withIndex()) {
             val chunkPayload = ChunkPayload(
                 index = chunk.index,
                 hash = Chunking.encodeChunkHash(chunk),
@@ -86,6 +87,11 @@ class Nip17CrashSender(
 
             // Publish chunk to all relays
             publisher.publishChunk(signedChunk).getOrElse { return Result.failure(it) }
+
+            // Add delay between chunks (not after last chunk)
+            if (index < chunkingResult.chunks.size - 1) {
+                kotlinx.coroutines.delay(chunkPublishDelayMs)
+            }
         }
 
         // Build manifest

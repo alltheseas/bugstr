@@ -311,12 +311,18 @@ class Bugstr {
         final result = chunkPayload(payloadBytes);
         debugPrint('Bugstr: split into ${result.chunks.length} chunks');
 
-        // Build and publish chunk events
+        // Build and publish chunk events with delay to avoid rate limiting
+        const chunkPublishDelay = Duration(milliseconds: 100);
         final chunkIds = <String>[];
-        for (final chunk in result.chunks) {
+        for (var i = 0; i < result.chunks.length; i++) {
+          final chunk = result.chunks[i];
           final chunkEvent = _buildChunkEvent(chunk);
           chunkIds.add(chunkEvent.id);
           await _publishToAllRelays(chunkEvent);
+          // Add delay between chunks (not after last chunk)
+          if (i < result.chunks.length - 1) {
+            await Future.delayed(chunkPublishDelay);
+          }
         }
         debugPrint('Bugstr: published ${result.chunks.length} chunks');
 

@@ -267,11 +267,17 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
     // Build chunk events
     const chunkEvents = chunks.map(buildChunkEvent);
 
-    // Publish chunks to all relays
+    // Publish chunks to all relays with delay to avoid rate limiting
     const chunkIds: string[] = [];
-    for (const chunkEvent of chunkEvents) {
+    const CHUNK_PUBLISH_DELAY_MS = 100; // Delay between chunks to avoid relay rate limits
+    for (let i = 0; i < chunkEvents.length; i++) {
+      const chunkEvent = chunkEvents[i];
       chunkIds.push(chunkEvent.id);
       await publishToAllRelays(relays, chunkEvent);
+      // Add delay between chunks (not after last chunk)
+      if (i < chunkEvents.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, CHUNK_PUBLISH_DELAY_MS));
+      }
     }
     console.info(`Bugstr: published ${chunks.length} chunks`);
 

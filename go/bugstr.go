@@ -578,13 +578,18 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		return err
 	}
 
-	// Build and publish chunk events
+	// Build and publish chunk events with delay to avoid rate limiting
+	const chunkPublishDelay = 100 * time.Millisecond
 	chunkIDs := make([]string, len(chunks))
 	for i, chunk := range chunks {
 		chunkEvent := buildChunkEvent(chunk)
 		chunkIDs[i] = chunkEvent.ID
 		if err := publishToAllRelays(ctx, relays, chunkEvent); err != nil {
 			return err
+		}
+		// Add delay between chunks (not after last chunk)
+		if i < len(chunks)-1 {
+			time.Sleep(chunkPublishDelay)
 		}
 	}
 
