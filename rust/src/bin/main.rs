@@ -801,7 +801,12 @@ async fn fetch_chunks_from_relay(
         .ids(needed)
         .kind(Kind::Custom(KIND_CHUNK));
 
-    let subscription_id = format!("bugstr-{}", &relay_url[6..].chars().take(8).collect::<String>());
+    // Safely extract relay identifier, handling both wss:// and ws:// schemes
+    let relay_suffix = relay_url
+        .strip_prefix("wss://")
+        .or_else(|| relay_url.strip_prefix("ws://"))
+        .unwrap_or(relay_url);
+    let subscription_id = format!("bugstr-{}", relay_suffix.chars().take(8).collect::<String>());
     let req = format!(
         r#"["REQ","{}",{}]"#,
         subscription_id,
