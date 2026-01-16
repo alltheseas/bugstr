@@ -3,6 +3,11 @@
 // Bugstr delivers crash reports via Nostr gift-wrapped encrypted direct messages
 // with user consent. Reports auto-expire after 30 days.
 //
+// For large crash reports (>50KB), uses CHK chunking:
+//   - Chunks are published as public events (kind 10422)
+//   - Manifest with root hash is gift-wrapped (kind 10421)
+//   - Only the recipient can decrypt chunks using the root hash
+//
 // Basic usage:
 //
 //	bugstr.Init(bugstr.Config{
@@ -17,12 +22,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand"
 	"regexp"
 	"runtime"
 	"strings"
@@ -33,6 +41,50 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/nbd-wtf/go-nostr/nip44"
 )
+
+// Transport layer constants
+const (
+	// KindDirect is the event kind for direct crash report delivery (<=50KB).
+	KindDirect = 10420
+	// KindManifest is the event kind for hashtree manifest (>50KB crash reports).
+	KindManifest = 10421
+	// KindChunk is the event kind for CHK-encrypted chunk data.
+	KindChunk = 10422
+	// DirectSizeThreshold is the size threshold for switching to chunked transport (50KB).
+	DirectSizeThreshold = 50 * 1024
+	// MaxChunkSize is the maximum chunk size (48KB).
+	MaxChunkSize = 48 * 1024
+)
+
+// DirectPayload wraps crash data for direct delivery (kind 10420).
+type DirectPayload struct {
+	V     int         `json:"v"`
+	Crash interface{} `json:"crash"`
+}
+
+// ManifestPayload contains metadata for chunked crash reports (kind 10421).
+type ManifestPayload struct {
+	V          int      `json:"v"`
+	RootHash   string   `json:"root_hash"`
+	TotalSize  int      `json:"total_size"`
+	ChunkCount int      `json:"chunk_count"`
+	ChunkIDs   []string `json:"chunk_ids"`
+}
+
+// ChunkPayload contains encrypted chunk data (kind 10422).
+type ChunkPayload struct {
+	V     int    `json:"v"`
+	Index int    `json:"index"`
+	Hash  string `json:"hash"`
+	Data  string `json:"data"`
+}
+
+// ChunkData holds chunked data before publishing.
+type ChunkData struct {
+	Index     int
+	Hash      []byte
+	Encrypted []byte
+}
 
 // Config holds the Bugstr configuration.
 type Config struct {
@@ -261,8 +313,79 @@ func truncateStack(stack string, lines int) string {
 func randomPastTimestamp() int64 {
 	now := time.Now().Unix()
 	maxOffset := int64(60 * 60 * 24 * 2) // up to 2 days
-	offset := rand.Int63n(maxOffset)
+	offset := mathrand.Int63n(maxOffset)
 	return now - offset
+}
+
+// chkEncrypt encrypts data using AES-256-CBC with the given key.
+// IV is prepended to the ciphertext.
+func chkEncrypt(data, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// PKCS7 padding
+	padLen := aes.BlockSize - len(data)%aes.BlockSize
+	padded := make([]byte, len(data)+padLen)
+	copy(padded, data)
+	for i := len(data); i < len(padded); i++ {
+		padded[i] = byte(padLen)
+	}
+
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+
+	encrypted := make([]byte, len(iv)+len(padded))
+	copy(encrypted, iv)
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(encrypted[aes.BlockSize:], padded)
+
+	return encrypted, nil
+}
+
+// chunkPayloadData splits data into chunks and encrypts each using CHK.
+func chunkPayloadData(data []byte) (rootHash string, chunks []ChunkData, err error) {
+	var chunkHashes [][]byte
+
+	offset := 0
+	index := 0
+	for offset < len(data) {
+		end := offset + MaxChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunkData := data[offset:end]
+
+		// Compute hash of plaintext chunk (becomes encryption key)
+		hash := sha256.Sum256(chunkData)
+		chunkHashes = append(chunkHashes, hash[:])
+
+		// Encrypt chunk using its hash as key
+		encrypted, err := chkEncrypt(chunkData, hash[:])
+		if err != nil {
+			return "", nil, err
+		}
+
+		chunks = append(chunks, ChunkData{
+			Index:     index,
+			Hash:      hash[:],
+			Encrypted: encrypted,
+		})
+
+		offset = end
+		index++
+	}
+
+	// Compute root hash from all chunk hashes
+	var rootHashInput []byte
+	for _, h := range chunkHashes {
+		rootHashInput = append(rootHashInput, h...)
+	}
+	rootHashBytes := sha256.Sum256(rootHashInput)
+	return hex.EncodeToString(rootHashBytes[:]), chunks, nil
 }
 
 func maybeCompress(plaintext string) string {
@@ -285,6 +408,143 @@ func maybeCompress(plaintext string) string {
 	return string(result)
 }
 
+// buildGiftWrap creates a NIP-17 gift-wrapped event for a rumor.
+func buildGiftWrap(rumorKind int, content string) (nostr.Event, error) {
+	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
+
+	rumor := map[string]interface{}{
+		"id":         "",
+		"pubkey":     senderPubkey,
+		"created_at": randomPastTimestamp(),
+		"kind":       rumorKind,
+		"tags":       [][]string{{"p", developerPubkeyHex}},
+		"content":    content,
+		"sig":        "",
+	}
+
+	serialized, _ := json.Marshal([]interface{}{
+		0,
+		rumor["pubkey"],
+		rumor["created_at"],
+		rumor["kind"],
+		rumor["tags"],
+		rumor["content"],
+	})
+	hash := sha256.Sum256(serialized)
+	rumor["id"] = hex.EncodeToString(hash[:])
+
+	rumorBytes, _ := json.Marshal(rumor)
+	conversationKey, err := nip44.GenerateConversationKey(senderPrivkey, developerPubkeyHex)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+	sealContent, err := nip44.Encrypt(string(rumorBytes), conversationKey)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	seal := nostr.Event{
+		Kind:      13,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{},
+		Content:   sealContent,
+	}
+	seal.Sign(senderPrivkey)
+
+	wrapperPrivkey := nostr.GeneratePrivateKey()
+	wrapKey, err := nip44.GenerateConversationKey(wrapperPrivkey, developerPubkeyHex)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	sealJSON, _ := json.Marshal(seal)
+	giftContent, err := nip44.Encrypt(string(sealJSON), wrapKey)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	giftWrap := nostr.Event{
+		Kind:      1059,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{{"p", developerPubkeyHex}},
+		Content:   giftContent,
+	}
+	giftWrap.Sign(wrapperPrivkey)
+
+	return giftWrap, nil
+}
+
+// buildChunkEvent creates a public chunk event (kind 10422).
+func buildChunkEvent(chunk ChunkData) nostr.Event {
+	chunkPrivkey := nostr.GeneratePrivateKey()
+	chunkPayload := ChunkPayload{
+		V:     1,
+		Index: chunk.Index,
+		Hash:  hex.EncodeToString(chunk.Hash),
+		Data:  base64.StdEncoding.EncodeToString(chunk.Encrypted),
+	}
+	content, _ := json.Marshal(chunkPayload)
+
+	event := nostr.Event{
+		Kind:      KindChunk,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{},
+		Content:   string(content),
+	}
+	event.Sign(chunkPrivkey)
+	return event
+}
+
+// publishToRelays publishes an event to the first successful relay.
+func publishToRelays(ctx context.Context, relays []string, event nostr.Event) error {
+	var lastErr error
+	for _, relayURL := range relays {
+		relay, err := nostr.RelayConnect(ctx, relayURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		err = relay.Publish(ctx, event)
+		relay.Close()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// publishToAllRelays publishes an event to all relays for redundancy.
+func publishToAllRelays(ctx context.Context, relays []string, event nostr.Event) error {
+	var wg sync.WaitGroup
+	successCount := 0
+	var mu sync.Mutex
+
+	for _, relayURL := range relays {
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			relay, err := nostr.RelayConnect(ctx, url)
+			if err != nil {
+				return
+			}
+			err = relay.Publish(ctx, event)
+			relay.Close()
+			if err == nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(relayURL)
+	}
+
+	wg.Wait()
+	if successCount == 0 {
+		return fmt.Errorf("failed to publish chunk to any relay")
+	}
+	return nil
+}
+
 func sendToNostr(ctx context.Context, payload *Payload) error {
 	relays := config.Relays
 	if len(relays) == 0 {
@@ -297,87 +557,51 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 	}
 
 	content := maybeCompress(string(plaintext))
-	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
+	payloadSize := len(content)
 
-	// Build unsigned kind 14 rumor
-	rumor := map[string]interface{}{
-		"id":         "", // Computed later
-		"pubkey":     senderPubkey,
-		"created_at": randomPastTimestamp(),
-		"kind":       14,
-		"tags":       [][]string{{"p", developerPubkeyHex}},
-		"content":    content,
-		"sig":        "",
-	}
+	if payloadSize <= DirectSizeThreshold {
+		// Small payload: direct gift-wrapped delivery
+		directPayload := DirectPayload{V: 1, Crash: payload}
+		directContent, _ := json.Marshal(directPayload)
 
-	// Compute rumor ID per NIP-01: sha256 of [0, pubkey, created_at, kind, tags, content]
-	serialized, _ := json.Marshal([]interface{}{
-		0,
-		rumor["pubkey"],
-		rumor["created_at"],
-		rumor["kind"],
-		rumor["tags"],
-		rumor["content"],
-	})
-	hash := sha256.Sum256(serialized)
-	rumorID := hex.EncodeToString(hash[:])
-	rumor["id"] = rumorID
-
-	// Encrypt rumor into seal
-	rumorBytes, _ := json.Marshal(rumor)
-	conversationKey, err := nip44.GenerateConversationKey(senderPrivkey, developerPubkeyHex)
-	if err != nil {
-		return err
-	}
-	sealContent, err := nip44.Encrypt(string(rumorBytes), conversationKey)
-	if err != nil {
-		return err
-	}
-
-	seal := nostr.Event{
-		Kind:      13,
-		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
-		Tags:      nostr.Tags{},
-		Content:   sealContent,
-	}
-	seal.Sign(senderPrivkey)
-
-	// Wrap seal in gift wrap with random key
-	wrapperPrivkey := nostr.GeneratePrivateKey()
-	wrapKey, err := nip44.GenerateConversationKey(wrapperPrivkey, developerPubkeyHex)
-	if err != nil {
-		return err
-	}
-
-	sealJSON, _ := json.Marshal(seal)
-	giftContent, err := nip44.Encrypt(string(sealJSON), wrapKey)
-	if err != nil {
-		return err
-	}
-
-	giftWrap := nostr.Event{
-		Kind:      1059,
-		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
-		Tags:      nostr.Tags{{"p", developerPubkeyHex}},
-		Content:   giftContent,
-	}
-	giftWrap.Sign(wrapperPrivkey)
-
-	// Publish to relays
-	var lastErr error
-	for _, relayURL := range relays {
-		relay, err := nostr.RelayConnect(ctx, relayURL)
+		giftWrap, err := buildGiftWrap(KindDirect, string(directContent))
 		if err != nil {
-			lastErr = err
-			continue
+			return err
 		}
-		err = relay.Publish(ctx, giftWrap)
-		relay.Close()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
+
+		return publishToRelays(ctx, relays, giftWrap)
 	}
 
-	return lastErr
+	// Large payload: chunked delivery
+	rootHash, chunks, err := chunkPayloadData([]byte(content))
+	if err != nil {
+		return err
+	}
+
+	// Build and publish chunk events
+	chunkIDs := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		chunkEvent := buildChunkEvent(chunk)
+		chunkIDs[i] = chunkEvent.ID
+		if err := publishToAllRelays(ctx, relays, chunkEvent); err != nil {
+			return err
+		}
+	}
+
+	// Build and publish manifest
+	manifest := ManifestPayload{
+		V:          1,
+		RootHash:   rootHash,
+		TotalSize:  len(content),
+		ChunkCount: len(chunks),
+		ChunkIDs:   chunkIDs,
+	}
+	manifestContent, _ := json.Marshal(manifest)
+
+	manifestGiftWrap, err := buildGiftWrap(KindManifest, string(manifestContent))
+	if err != nil {
+		return err
+	}
+
+	return publishToRelays(ctx, relays, manifestGiftWrap)
 }
