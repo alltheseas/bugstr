@@ -8,12 +8,13 @@ Bugstr packages the crash reporting flow that [Amethyst](https://github.com/vito
 
 ### Supported Platforms
 
-Android/Kotlin ✅
-Typescript - https://github.com/alltheseas/Bugstr-TS
+- Android/Kotlin ✅
+- TypeScript - https://github.com/alltheseas/Bugstr-TS
+- Flutter/Dart - 🚧 Planned
 
 ## Components
 
-Bugstr ships three small building blocks:
+Bugstr ships four building blocks:
 
 1. `BugstrCrashReportCache` stores crash stack traces on disk. It defaults to one slot; set `maxReports` or a custom `slotKey` for multi-slot rotation. All disk I/O is suspend and runs on `Dispatchers.IO`.
 2. `BugstrCrashHandler` installs an `UncaughtExceptionHandler`, accepts an attachments provider, and blocks the crashing thread with a bounded timeout while flushing to disk.
@@ -109,4 +110,36 @@ In this example the `expiresDays` flag is what turns the DM composer into a NIP-
 - You can store multiple crashes by setting `maxReports` or providing a slot key when writing. The prompt iterates through everything it finds.
 - `BugstrCrashPrompt` offers a “Keep for later” button that rewrites the remaining reports to disk instead of discarding them.
 - `BugstrReportAssembler` recurses through the entire `Throwable` cause chain, trims overly large traces (default 200k characters), and intentionally omits `Build.HOST`/`Build.USER` to keep ROM build metadata out of the report. Tune `maxStackCharacters` if needed.
-- Attachments are supported via the crash handler’s `attachmentsProvider`. They render under their own headings and are truncated for safety.
+- Attachments are supported via the crash handler's `attachmentsProvider`. They render under their own headings and are truncated for safety.
+
+## NIP-17 Crypto Module
+
+The `bugstr-nostr-crypto` module provides standalone NIP-17/44/59 gift wrap building:
+
+```kotlin
+val builder = Nip17PayloadBuilder(giftWrapper)
+val wraps = builder.buildGiftWraps(
+    Nip17Request(
+        senderPubKey = myPubKey,
+        senderPrivateKeyHex = myPrivKey,
+        recipients = listOf(Nip17Recipient(pubKeyHex = devPubKey)),
+        plaintext = crashReport,
+        expirationSeconds = 30 * 24 * 60 * 60, // 30 days
+    )
+)
+// Sign and publish wraps.map { it.giftWrap } to relays
+```
+
+### NIP Compliance
+
+The implementation follows:
+- **NIP-17** - Private Direct Messages (kind 14 rumors)
+- **NIP-44** - Versioned Encryption (v2)
+- **NIP-59** - Gift Wrap (rumor → seal → gift wrap)
+- **NIP-40** - Expiration Timestamp
+
+**Important**: Rumors include `id` (computed) and `sig: ""` (empty string) per spec. Some clients reject messages without these fields.
+
+## Contributing
+
+See [AGENTS.md](AGENTS.md) for contributor guidelines.

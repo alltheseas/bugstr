@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CHANGELOG.md for tracking version history
 - `UnsignedNostrEvent.computeId()` method for NIP-01 compliant event ID computation
 - Unit tests for `UnsignedNostrEvent` serialization and ID computation
+- NIP-17 crypto module documentation in README
+- Flutter/Dart listed as planned platform
+
+### Changed
+- README now correctly states "four building blocks" instead of "three"
 
 ### Fixed
 - `UnsignedNostrEvent.toJson()` now includes `id` and `sig` fields for NIP-17 compliance
