@@ -327,7 +327,7 @@ async fn serve(
                 } else {
                     println!("  {} {} mapping files loaded", "Loaded:".cyan(), count);
                 }
-                Some(Symbolicator::new(store))
+                Some(Arc::new(Symbolicator::new(store)))
             }
             Err(e) => {
                 eprintln!("{} Failed to scan mappings: {}", "error".red(), e);

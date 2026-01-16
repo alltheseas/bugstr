@@ -25,7 +25,7 @@ struct Assets;
 /// Shared application state.
 pub struct AppState {
     pub storage: Mutex<CrashStorage>,
-    pub symbolicator: Option<Symbolicator>,
+    pub symbolicator: Option<Arc<Symbolicator>>,
 }
 
 /// Creates the web server router.
@@ -111,8 +111,17 @@ async fn symbolicate_stack(
         build_id: request.build_id,
     };
 
-    match symbolicator.symbolicate(&request.stack_trace, &context) {
-        Ok(result) => Json(SymbolicateResponse {
+    // Clone Arc for move into spawn_blocking
+    let symbolicator = Arc::clone(symbolicator);
+    let stack_trace = request.stack_trace;
+
+    // Run symbolication in blocking task pool to avoid blocking async runtime
+    let result = tokio::task::spawn_blocking(move || {
+        symbolicator.symbolicate(&stack_trace, &context)
+    }).await;
+
+    match result {
+        Ok(Ok(result)) => Json(SymbolicateResponse {
             symbolicated_count: result.symbolicated_count,
             total_count: result.total_count,
             percentage: result.percentage(),
@@ -126,9 +135,13 @@ async fn symbolicate_stack(
                 symbolicated: f.symbolicated,
             }).collect(),
         }).into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() }))
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Task failed: {}", e) }))
         ).into_response(),
     }
 }
