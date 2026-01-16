@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - None
 
 ### Fixed
-- None
+- ProGuard/R8 parsing now supports `:origStart:origEnd` line range format
+- Overloaded/inlined methods with same obfuscated name now correctly differentiated by line range
+- Original line numbers preserved when method mapping is missing or line range doesn't match
+- Path validation in `MappingStore.save_mapping` prevents directory traversal attacks
 
 ## [0.1.0] - 2025-01-15
 

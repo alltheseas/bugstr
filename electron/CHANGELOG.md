@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Moved to bugstr monorepo from standalone bugstr-ts repository
 
+### Fixed
+- `clearPendingReports()` no longer throws when called before `init()`
+
 ## [0.1.0] - 2025-01-15
 
 ### Added
