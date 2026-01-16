@@ -115,10 +115,15 @@ Include relay hints in manifest for chunk locations:
 ### Suggested Default Values
 
 ```rust
-const DEFAULT_CHUNK_PUBLISH_DELAY_MS: u64 = 100; // Between chunks
+// 7500ms between posts to same relay (strfry+noteguard: 8 posts/min = 7500ms)
+const DEFAULT_CHUNK_PUBLISH_DELAY_MS: u64 = 7500;
 const DEFAULT_RELAY_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_CHUNK_FETCH_TIMEOUT_MS: u64 = 30_000;
 ```
+
+Note: With round-robin distribution across N relays, effective throughput is
+N × (1000 / 7500) = N × 0.13 chunks/second per relay, or ~8 chunks/minute total
+when using 4 relays.
 
 ## Testing Plan
 

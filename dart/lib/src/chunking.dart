@@ -117,12 +117,12 @@ Uint8List chkDecrypt(Uint8List data, Uint8List contentHash) {
     ),
   );
 
+  // getOutputSize for decrypt returns plaintext length (excludes auth tag)
   final plaintext = Uint8List(cipher.getOutputSize(data.length));
   final len = cipher.processBytes(data, 0, data.length, plaintext, 0);
   cipher.doFinal(plaintext, len);
 
-  // Remove padding (GCM output size includes space for tag on decrypt)
-  return plaintext.sublist(0, data.length - _tagSize);
+  return plaintext;
 }
 
 /// Computes SHA-256 hash of data.

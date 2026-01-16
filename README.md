@@ -104,7 +104,7 @@ The Rust receiver includes built-in symbolication for 7 platforms:
 
 | Platform | Mapping File | Notes |
 |----------|--------------|-------|
-| Android | `mapping.txt` | ProGuard/R8 with full line range support |
+| Android | `mapping.txt` | ProGuard/R8 with full line-range support |
 | Electron/JS | `*.js.map` | Source map v3 |
 | Flutter | `*.symbols` | Via `flutter symbolize` or direct parsing |
 | Rust | Backtrace | Debug builds include source locations |

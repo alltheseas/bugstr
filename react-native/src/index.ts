@@ -421,8 +421,11 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
       const successRelay = await publishChunkWithVerify(chunkEvent, relays, i % relays.length);
       if (successRelay) {
         chunkRelays[chunkEvent.id] = [successRelay];
+      } else {
+        // All relays failed for this chunk - fail fast to avoid partial uploads
+        console.error(`Bugstr: failed to publish chunk ${i}/${totalChunks} (id: ${chunkEvent.id})`);
+        throw new Error(`Failed to publish chunk ${i} to any relay after retries`);
       }
-      // If all relays failed, chunk is lost - receiver will report missing chunk
 
       // Report progress
       const remainingChunks = totalChunks - i - 1;

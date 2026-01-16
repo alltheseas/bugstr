@@ -48,9 +48,16 @@ class Nip17CrashSender(
 
     private suspend fun sendDirect(request: Nip17SendRequest): Result<Unit> {
         // Wrap in DirectPayload format
+        val crashJson = try {
+            JSONObject(request.plaintext)
+        } catch (e: org.json.JSONException) {
+            // If plaintext is not valid JSON, wrap it as a raw string
+            JSONObject().apply { put("raw", request.plaintext) }
+        }
+
         val directPayload = JSONObject().apply {
             put("v", 1)
-            put("crash", JSONObject(request.plaintext))
+            put("crash", crashJson)
         }
 
         val directRequest = request.copy(

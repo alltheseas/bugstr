@@ -582,14 +582,15 @@ def _publish_chunk_to_relay(event: Event, relay_url: str) -> bool:
 def _verify_chunk_exists(event_id: str, relay_url: str) -> bool:
     """Verify a chunk event exists on a relay."""
     try:
-        from nostr_sdk import Filter
+        from datetime import timedelta
+        from nostr_sdk import Filter, EventSource
         client = Client(Keys.generate())
         client.add_relay(relay_url)
         client.connect()
 
         # Query for the specific event by ID
         filter = Filter().id(event_id).kind(Kind(KIND_CHUNK)).limit(1)
-        events = client.get_events_of([filter], timeout=5)
+        events = client.get_events_of([filter], EventSource.relays(timedelta(seconds=5)))
         client.disconnect()
 
         return len(events) > 0
@@ -642,17 +643,20 @@ def _send_to_nostr(payload: Payload) -> None:
 
     try:
         plaintext = json.dumps(payload.to_dict())
-        content = _maybe_compress(plaintext)
-        payload_bytes = content.encode()
-        payload_size = len(payload_bytes)
+        plaintext_bytes = plaintext.encode()
+        payload_size = len(plaintext_bytes)
 
         if payload_size <= DIRECT_SIZE_THRESHOLD:
-            # Small payload: direct gift-wrapped delivery (no progress needed)
+            # Small payload: direct gift-wrapped delivery (no compression needed)
             direct_payload = {"v": 1, "crash": payload.to_dict()}
             gift_wrap = _build_gift_wrap(KIND_DIRECT, json.dumps(direct_payload))
             _publish_to_relays(gift_wrap)
         else:
-            # Large payload: chunked delivery with round-robin distribution
+            # Large payload: compress and chunk for delivery
+            compressed = _maybe_compress(plaintext)
+            payload_bytes = compressed.encode()
+
+            # Chunked delivery with round-robin distribution
             root_hash, chunks = _chunk_payload(payload_bytes)
             total_chunks = len(chunks)
             relays = _config.relays or DEFAULT_RELAYS

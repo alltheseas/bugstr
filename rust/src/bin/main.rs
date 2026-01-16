@@ -908,10 +908,13 @@ async fn handle_message_for_storage(
 
     let rumor_kind = rumor.kind as u16;
 
+    // Decompress payload once before any parsing (handles both compressed manifests and direct payloads)
+    let decompressed = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
+
     // Handle different transport kinds
     if is_chunked_kind(rumor_kind) {
         // Kind 10421: Manifest for chunked crash report
-        match ManifestPayload::from_json(&rumor.content) {
+        match ManifestPayload::from_json(&decompressed) {
             Ok(manifest) => {
                 println!(
                     "{} Received manifest: {} chunks, {} bytes total",
@@ -963,10 +966,7 @@ async fn handle_message_for_storage(
         }
     }
 
-    // Decompress if needed
-    let decompressed = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
-
-    // Extract crash content based on transport kind
+    // Extract crash content based on transport kind (decompressed already computed above)
     let content = if is_crash_report_kind(rumor_kind) {
         // Kind 10420: Direct crash report with DirectPayload wrapper
         match DirectPayload::from_json(&decompressed) {

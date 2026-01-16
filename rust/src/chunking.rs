@@ -81,7 +81,7 @@ pub struct ChunkingResult {
 ///
 /// # Arguments
 ///
-/// * `data` - The payload bytes to chunk (should be >50KB)
+/// * `data` - The payload bytes to chunk (must be >50KB, use direct transport for smaller payloads)
 ///
 /// # Returns
 ///
@@ -89,9 +89,16 @@ pub struct ChunkingResult {
 ///
 /// # Errors
 ///
-/// Returns `ChunkingError::EncryptionError` if CHK encryption fails.
+/// * `ChunkingError::PayloadTooSmall` if data is ≤50KB (use direct transport instead)
+/// * `ChunkingError::EncryptionError` if CHK encryption fails
 pub fn chunk_payload(data: &[u8]) -> Result<ChunkingResult, ChunkingError> {
     use base64::Engine;
+    use crate::transport::DIRECT_SIZE_THRESHOLD;
+
+    // Enforce minimum size - payloads ≤50KB should use direct transport
+    if data.len() <= DIRECT_SIZE_THRESHOLD {
+        return Err(ChunkingError::PayloadTooSmall);
+    }
 
     let total_size = data.len() as u64;
     let chunk_size = MAX_CHUNK_SIZE;
@@ -295,14 +302,28 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_and_reassemble_small() {
-        // Small payload that fits in one chunk
-        let data = vec![42u8; 1000];
+    fn test_payload_too_small_error() {
+        // Payloads ≤50KB should return PayloadTooSmall error
+        let small_data = vec![42u8; 1000];
+        let result = chunk_payload(&small_data);
+        assert!(matches!(result, Err(ChunkingError::PayloadTooSmall)));
+
+        // Exactly at threshold should also error
+        let threshold_data = vec![42u8; 50 * 1024];
+        let result = chunk_payload(&threshold_data);
+        assert!(matches!(result, Err(ChunkingError::PayloadTooSmall)));
+    }
+
+    #[test]
+    fn test_chunk_and_reassemble_minimum() {
+        // Just over DIRECT_SIZE_THRESHOLD (50KB) - produces 2 chunks because MAX_CHUNK_SIZE is 48KB
+        // 50KB+1 = 51201 bytes → chunk 0: 48KB, chunk 1: ~3KB
+        let data = vec![42u8; 50 * 1024 + 1];
         let result = chunk_payload(&data).unwrap();
 
-        assert_eq!(result.chunks.len(), 1);
-        assert_eq!(result.manifest.chunk_count, 1);
-        assert_eq!(result.manifest.total_size, 1000);
+        assert_eq!(result.chunks.len(), 2);
+        assert_eq!(result.manifest.chunk_count, 2);
+        assert_eq!(result.manifest.total_size, 50 * 1024 + 1);
 
         let reassembled = reassemble_payload(&result.manifest, &result.chunks).unwrap();
         assert_eq!(reassembled, data);
@@ -323,7 +344,8 @@ mod tests {
 
     #[test]
     fn test_root_hash_deterministic() {
-        let data = vec![1, 2, 3, 4, 5];
+        // Payload must be >50KB
+        let data: Vec<u8> = (0..60_000).map(|i| (i % 256) as u8).collect();
         let result1 = chunk_payload(&data).unwrap();
         let result2 = chunk_payload(&data).unwrap();
 
@@ -332,7 +354,8 @@ mod tests {
 
     #[test]
     fn test_chunk_hash_verification() {
-        let data = vec![42u8; 1000];
+        // Payload must be >50KB
+        let data: Vec<u8> = (0..60_000).map(|i| (i % 256) as u8).collect();
         let mut result = chunk_payload(&data).unwrap();
 
         // Corrupt chunk hash (which is the decryption key)

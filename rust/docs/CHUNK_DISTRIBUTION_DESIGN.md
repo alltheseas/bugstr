@@ -245,7 +245,7 @@ async function sendChunked(payload: CrashPayload, onProgress?: ChunkProgressCall
 
     // Report progress
     onProgress?.({
-      phase: 'chunks',
+      phase: 'uploading',
       current: i + 1,
       total: chunks.length,
       percent: Math.round((i + 1) / chunks.length * 100),

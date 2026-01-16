@@ -623,16 +623,20 @@ func publishToAllRelays(ctx context.Context, relays []string, event nostr.Event)
 
 // waitForRateLimit waits until enough time has passed since the last post to this relay.
 func waitForRateLimit(relayURL string) {
+	// Compute sleep duration while holding lock to avoid race condition
 	lastPostTimeMu.Lock()
 	lastTime, exists := lastPostTime[relayURL]
-	lastPostTimeMu.Unlock()
-
+	var sleepDuration time.Duration
 	if exists {
 		rateLimit := GetRelayRateLimit(relayURL)
-		elapsed := time.Since(lastTime)
-		if elapsed < rateLimit {
-			time.Sleep(rateLimit - elapsed)
-		}
+		deadline := lastTime.Add(rateLimit)
+		sleepDuration = time.Until(deadline)
+	}
+	lastPostTimeMu.Unlock()
+
+	// Sleep outside of lock
+	if sleepDuration > 0 {
+		time.Sleep(sleepDuration)
 	}
 }
 

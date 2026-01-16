@@ -68,6 +68,11 @@ pub const MAX_CHUNK_SIZE: usize = 48 * 1024; // 48KB
 ///
 /// Used for crash reports that fit within the direct transport threshold.
 /// The payload is JSON-serialized and placed in the event content field.
+///
+/// # Fields
+///
+/// * `v` - Protocol version (currently 1) for forward compatibility
+/// * `crash` - JSON object containing crash data (message, stack, timestamp, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectPayload {
     /// Protocol version for forward compatibility.
@@ -81,16 +86,49 @@ pub struct DirectPayload {
 
 impl DirectPayload {
     /// Creates a new direct payload with the given crash data.
+    ///
+    /// # Parameters
+    ///
+    /// * `crash` - A `serde_json::Value` containing the crash report data.
+    ///   Typically a JSON object with fields like `message`, `stack`, `timestamp`, etc.
+    ///
+    /// # Returns
+    ///
+    /// A new `DirectPayload` with protocol version 1.
     pub fn new(crash: serde_json::Value) -> Self {
         Self { v: 1, crash }
     }
 
-    /// Serializes the payload to JSON string.
+    /// Serializes the payload to a JSON string.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(String)` - The JSON-serialized payload
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if serialization fails. This can occur if
+    /// the `crash` field contains values that cannot be serialized (e.g., NaN floats).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
-    /// Deserializes a payload from JSON string.
+    /// Deserializes a payload from a JSON string.
+    ///
+    /// # Parameters
+    ///
+    /// * `json` - A JSON string representing a `DirectPayload`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(DirectPayload)` - The deserialized payload
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if:
+    /// * The JSON is malformed or invalid
+    /// * Required fields (`v`, `crash`) are missing
+    /// * Field types don't match expected types
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
@@ -100,6 +138,20 @@ impl DirectPayload {
 ///
 /// Contains metadata needed to fetch and decrypt a chunked crash report.
 /// The root_hash serves as the CHK (Content Hash Key) for decryption.
+///
+/// # Fields
+///
+/// * `v` - Protocol version (currently 1) for forward compatibility
+/// * `root_hash` - Hex-encoded root hash (the CHK decryption key)
+/// * `total_size` - Original uncompressed payload size in bytes
+/// * `chunk_count` - Number of chunks to fetch
+/// * `chunk_ids` - Ordered list of chunk event IDs (kind 10422)
+/// * `chunk_relays` - Optional relay hints mapping chunk IDs to relay URLs
+///
+/// # Security
+///
+/// The manifest is delivered via NIP-17 gift wrap, keeping the `root_hash`
+/// secret. Without the root hash, chunks cannot be decrypted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestPayload {
     /// Protocol version for forward compatibility.
@@ -132,12 +184,36 @@ pub struct ManifestPayload {
 }
 
 impl ManifestPayload {
-    /// Serializes the manifest to JSON string.
+    /// Serializes the manifest to a JSON string.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(String)` - The JSON-serialized manifest
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if serialization fails. This is unlikely
+    /// for valid manifest data but can occur with invalid UTF-8 in strings.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
-    /// Deserializes a manifest from JSON string.
+    /// Deserializes a manifest from a JSON string.
+    ///
+    /// # Parameters
+    ///
+    /// * `json` - A JSON string representing a `ManifestPayload`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ManifestPayload)` - The deserialized manifest
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if:
+    /// * The JSON is malformed or invalid
+    /// * Required fields (`v`, `root_hash`, `total_size`, `chunk_count`, `chunk_ids`) are missing
+    /// * Field types don't match (e.g., `total_size` is not a number)
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
@@ -146,7 +222,20 @@ impl ManifestPayload {
 /// Chunk payload (kind 10422).
 ///
 /// Contains a single CHK-encrypted chunk of crash report data.
-/// Public event - encryption via CHK prevents unauthorized decryption.
+/// Published as a public event - CHK encryption prevents unauthorized decryption
+/// since the decryption key (root_hash) is only in the private manifest.
+///
+/// # Fields
+///
+/// * `v` - Protocol version (currently 1) for forward compatibility
+/// * `index` - Zero-based chunk index for ordering during reassembly
+/// * `hash` - Hex-encoded SHA-256 hash of plaintext (also the CHK decryption key for this chunk)
+/// * `data` - Base64-encoded AES-256-GCM ciphertext with appended auth tag
+///
+/// # Security
+///
+/// Chunks are public but opaque without the manifest's root_hash. The hash field
+/// is the CHK for this specific chunk, derived via HKDF from the content hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkPayload {
     /// Protocol version for forward compatibility.
@@ -165,12 +254,36 @@ pub struct ChunkPayload {
 }
 
 impl ChunkPayload {
-    /// Serializes the chunk to JSON string.
+    /// Serializes the chunk to a JSON string.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(String)` - The JSON-serialized chunk
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if serialization fails. This is unlikely
+    /// for valid chunk data.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
-    /// Deserializes a chunk from JSON string.
+    /// Deserializes a chunk from a JSON string.
+    ///
+    /// # Parameters
+    ///
+    /// * `json` - A JSON string representing a `ChunkPayload`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ChunkPayload)` - The deserialized chunk
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if:
+    /// * The JSON is malformed or invalid
+    /// * Required fields (`v`, `index`, `hash`, `data`) are missing
+    /// * Field types don't match expected types
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
