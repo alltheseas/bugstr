@@ -3,8 +3,25 @@
  *
  * Captures crashes, caches them locally, and sends via NIP-17 gift-wrapped
  * encrypted DMs on next app launch with user consent.
+ *
+ * For large crash reports (>50KB), uses CHK chunking:
+ * - Chunks are published as public events (kind 10422)
+ * - Manifest with root hash is gift-wrapped (kind 10421)
+ * - Only the recipient can decrypt chunks using the root hash
  */
 import { nip19, nip44, finalizeEvent, generateSecretKey, getPublicKey, getEventHash, Relay } from "nostr-tools";
+import { maybeCompressPayload } from "./compression.js";
+import {
+  KIND_DIRECT,
+  KIND_MANIFEST,
+  KIND_CHUNK,
+  DIRECT_SIZE_THRESHOLD,
+  getTransportKind,
+  createDirectPayload,
+  type ManifestPayload,
+  type ChunkPayload,
+} from "./transport.js";
+import { chunkPayload, type ChunkData } from "./chunking.js";
 import Store from "electron-store";
 
 export type BugstrConfig = {
@@ -141,34 +158,33 @@ export function clearPendingReports(): void {
   store.set("pendingReports", []);
 }
 
-async function sendToNostr(payload: BugstrPayload): Promise<void> {
-  if (!developerPubkeyHex || !senderPrivkey) {
-    throw new Error("Bugstr Nostr keys not configured");
-  }
-
-  const relays = config.relays?.length ? config.relays : DEFAULT_RELAYS;
-  const plaintext = JSON.stringify(payload);
-
-  // Build rumor (kind 14, unsigned)
+/**
+ * Build a NIP-17 gift-wrapped event for a rumor.
+ */
+function buildGiftWrap(
+  rumorKind: number,
+  content: string,
+  senderPrivkey: Uint8Array,
+  recipientPubkey: string
+): ReturnType<typeof finalizeEvent> {
   const rumorEvent = {
-    kind: 14,
+    kind: rumorKind,
     created_at: randomPastTimestamp(),
-    tags: [["p", developerPubkeyHex]],
-    content: plaintext,
+    tags: [["p", recipientPubkey]],
+    content,
     pubkey: getPublicKey(senderPrivkey),
   };
 
-  // Compute rumor ID per NIP-01
   const rumorId = getEventHash(rumorEvent);
-  const unsignedKind14 = {
+  const unsignedRumor = {
     ...rumorEvent,
     id: rumorId,
     sig: "", // Empty signature for rumors per NIP-17
   };
 
   // Seal (kind 13)
-  const conversationKey = nip44.getConversationKey(senderPrivkey, developerPubkeyHex);
-  const sealContent = nip44.encrypt(JSON.stringify(unsignedKind14), conversationKey);
+  const conversationKey = nip44.getConversationKey(senderPrivkey, recipientPubkey);
+  const sealContent = nip44.encrypt(JSON.stringify(unsignedRumor), conversationKey);
   const seal = finalizeEvent(
     {
       kind: 13,
@@ -181,32 +197,145 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
 
   // Gift wrap (kind 1059)
   const wrapperPrivBytes = generateSecretKey();
-  const wrapKey = nip44.getConversationKey(wrapperPrivBytes, developerPubkeyHex);
+  const wrapKey = nip44.getConversationKey(wrapperPrivBytes, recipientPubkey);
   const giftWrapContent = nip44.encrypt(JSON.stringify(seal), wrapKey);
-  const giftWrap = finalizeEvent(
+  return finalizeEvent(
     {
       kind: 1059,
       created_at: randomPastTimestamp(),
-      tags: [["p", developerPubkeyHex]],
+      tags: [["p", recipientPubkey]],
       content: giftWrapContent,
     },
     wrapperPrivBytes
   );
+}
 
-  // Publish to relays
+/**
+ * Build a public chunk event (kind 10422).
+ */
+function buildChunkEvent(chunk: ChunkData): ReturnType<typeof finalizeEvent> {
+  const chunkPrivkey = generateSecretKey();
+  const chunkPayload: ChunkPayload = {
+    v: 1,
+    index: chunk.index,
+    hash: chunk.hash,
+    data: chunk.encrypted.toString("base64"),
+  };
+  return finalizeEvent(
+    {
+      kind: KIND_CHUNK,
+      created_at: randomPastTimestamp(),
+      tags: [],
+      content: JSON.stringify(chunkPayload),
+    },
+    chunkPrivkey
+  );
+}
+
+async function sendToNostr(payload: BugstrPayload): Promise<void> {
+  if (!developerPubkeyHex || !senderPrivkey) {
+    throw new Error("Bugstr Nostr keys not configured");
+  }
+
+  const relays = config.relays?.length ? config.relays : DEFAULT_RELAYS;
+
+  // Compress and check size
+  const rawJson = JSON.stringify(payload);
+  const compressed = maybeCompressPayload(rawJson);
+  const payloadBytes = Buffer.from(compressed, "utf-8");
+  const transportKind = getTransportKind(payloadBytes.length);
+
+  if (transportKind === "direct") {
+    // Small payload: direct gift-wrapped delivery
+    const directPayload = createDirectPayload(payload as Record<string, unknown>);
+    const giftWrap = buildGiftWrap(
+      KIND_DIRECT,
+      JSON.stringify(directPayload),
+      senderPrivkey,
+      developerPubkeyHex
+    );
+
+    await publishToRelays(relays, giftWrap);
+    console.info("Bugstr: sent direct crash report");
+  } else {
+    // Large payload: chunked delivery
+    console.info(`Bugstr: payload ${payloadBytes.length} bytes, using chunked transport`);
+
+    const { rootHash, totalSize, chunks } = chunkPayload(payloadBytes);
+    console.info(`Bugstr: split into ${chunks.length} chunks`);
+
+    // Build chunk events
+    const chunkEvents = chunks.map(buildChunkEvent);
+
+    // Publish chunks to all relays
+    const chunkIds: string[] = [];
+    for (const chunkEvent of chunkEvents) {
+      chunkIds.push(chunkEvent.id);
+      await publishToAllRelays(relays, chunkEvent);
+    }
+    console.info(`Bugstr: published ${chunks.length} chunks`);
+
+    // Build and publish manifest
+    const manifest: ManifestPayload = {
+      v: 1,
+      root_hash: rootHash,
+      total_size: totalSize,
+      chunk_count: chunks.length,
+      chunk_ids: chunkIds,
+    };
+
+    const manifestGiftWrap = buildGiftWrap(
+      KIND_MANIFEST,
+      JSON.stringify(manifest),
+      senderPrivkey,
+      developerPubkeyHex
+    );
+
+    await publishToRelays(relays, manifestGiftWrap);
+    console.info("Bugstr: sent chunked crash report manifest");
+  }
+}
+
+/**
+ * Publish an event to the first successful relay.
+ */
+async function publishToRelays(
+  relays: string[],
+  event: ReturnType<typeof finalizeEvent>
+): Promise<void> {
   let lastError: Error | undefined;
   for (const relayUrl of relays) {
     try {
       const relay = await Relay.connect(relayUrl);
-      await relay.publish(giftWrap);
+      await relay.publish(event);
       relay.close();
-      console.info(`Bugstr: published to ${relayUrl}`);
       return;
     } catch (err) {
       lastError = err as Error;
     }
   }
   throw lastError || new Error("Unable to publish Bugstr event");
+}
+
+/**
+ * Publish an event to all relays (for chunk redundancy).
+ */
+async function publishToAllRelays(
+  relays: string[],
+  event: ReturnType<typeof finalizeEvent>
+): Promise<void> {
+  const results = await Promise.allSettled(
+    relays.map(async (relayUrl) => {
+      const relay = await Relay.connect(relayUrl);
+      await relay.publish(event);
+      relay.close();
+    })
+  );
+
+  const successful = results.filter((r) => r.status === "fulfilled").length;
+  if (successful === 0) {
+    throw new Error("Unable to publish chunk to any relay");
+  }
 }
 
 async function showElectronDialog(summary: BugstrSummary): Promise<boolean> {
