@@ -12,7 +12,7 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 |----------|--------|-----------|
 | Android/Kotlin | Production | [`android/`](android/) |
 | TypeScript | Production | [`typescript/`](typescript/) |
-| Flutter/Dart | Planned | `dart/` |
+| Flutter/Dart | Skeleton | [`dart/`](dart/) |
 
 ## How It Works
 
