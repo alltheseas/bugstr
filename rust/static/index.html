@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bugstr - Crash Reports</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --error: #f85149;
+            --warning: #d29922;
+            --success: #3fb950;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--error);
+        }
+
+        .stats {
+            display: flex;
+            gap: 24px;
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 8px 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .tab:hover {
+            border-color: var(--text-muted);
+        }
+
+        .tab.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+
+        .crash-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .crash-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .crash-item:hover {
+            border-color: var(--text-muted);
+        }
+
+        .crash-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+
+        .crash-type {
+            font-weight: 600;
+            color: var(--error);
+            font-family: monospace;
+        }
+
+        .crash-time {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .crash-message {
+            font-size: 14px;
+            color: var(--text);
+            margin-bottom: 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .crash-meta {
+            display: flex;
+            gap: 16px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .crash-meta span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .badge-env {
+            background: #1f6feb33;
+            color: var(--accent);
+        }
+
+        .badge-version {
+            background: #3fb95033;
+            color: var(--success);
+        }
+
+        /* Group view */
+        .group-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .group-info {
+            flex: 1;
+        }
+
+        .group-count {
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--error);
+            min-width: 60px;
+            text-align: right;
+        }
+
+        .group-versions {
+            display: flex;
+            gap: 4px;
+            margin-top: 4px;
+        }
+
+        /* Detail modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        .modal.open {
+            display: flex;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            max-width: 900px;
+            width: 100%;
+            max-height: fit-content;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 24px;
+            cursor: pointer;
+            padding: 4px 8px;
+        }
+
+        .modal-close:hover {
+            color: var(--text);
+        }
+
+        .modal-body {
+            padding: 20px;
+        }
+
+        .detail-section {
+            margin-bottom: 20px;
+        }
+
+        .detail-section h3 {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .stack-trace {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 16px;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .detail-item {
+            background: var(--bg);
+            padding: 12px;
+            border-radius: 6px;
+        }
+
+        .detail-item label {
+            display: block;
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .detail-item span {
+            font-family: monospace;
+            font-size: 13px;
+            word-break: break-all;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+
+        .empty-state h2 {
+            margin-bottom: 8px;
+            color: var(--text);
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">bugstr</div>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="total-crashes">-</div>
+                    <div class="stat-label">Total Crashes</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="total-groups">-</div>
+                    <div class="stat-label">Unique Issues</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" data-view="crashes">Recent Crashes</button>
+            <button class="tab" data-view="groups">Grouped by Issue</button>
+        </div>
+
+        <main id="content">
+            <div class="loading">Loading crash reports...</div>
+        </main>
+    </div>
+
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="crash-type" id="modal-type">Error</span>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body"></div>
+        </div>
+    </div>
+
+    <script>
+        let crashes = [];
+        let groups = [];
+        let currentView = 'crashes';
+
+        // Fetch data on load
+        async function init() {
+            await Promise.all([
+                fetchCrashes(),
+                fetchGroups(),
+                fetchStats()
+            ]);
+            render();
+        }
+
+        async function fetchCrashes() {
+            try {
+                const res = await fetch('/api/crashes');
+                crashes = await res.json();
+            } catch (e) {
+                console.error('Failed to fetch crashes:', e);
+                crashes = [];
+            }
+        }
+
+        async function fetchGroups() {
+            try {
+                const res = await fetch('/api/groups');
+                groups = await res.json();
+            } catch (e) {
+                console.error('Failed to fetch groups:', e);
+                groups = [];
+            }
+        }
+
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const stats = await res.json();
+                document.getElementById('total-crashes').textContent = stats.total_crashes;
+                document.getElementById('total-groups').textContent = groups.length || '-';
+            } catch (e) {
+                console.error('Failed to fetch stats:', e);
+            }
+        }
+
+        function render() {
+            document.getElementById('total-groups').textContent = groups.length;
+
+            if (currentView === 'crashes') {
+                renderCrashes();
+            } else {
+                renderGroups();
+            }
+        }
+
+        function renderCrashes() {
+            const content = document.getElementById('content');
+
+            if (crashes.length === 0) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <h2>No crashes yet</h2>
+                        <p>Crash reports will appear here when received from your apps.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            content.innerHTML = `
+                <div class="crash-list">
+                    ${crashes.map(crash => `
+                        <div class="crash-item" onclick="showCrash(${crash.id})">
+                            <div class="crash-header">
+                                <span class="crash-type">${escapeHtml(crash.exception_type || 'Unknown Error')}</span>
+                                <span class="crash-time">${formatTime(crash.received_at)}</span>
+                            </div>
+                            <div class="crash-message">${escapeHtml(crash.message || 'No message')}</div>
+                            <div class="crash-meta">
+                                ${crash.environment ? `<span class="badge badge-env">${escapeHtml(crash.environment)}</span>` : ''}
+                                ${crash.app_version ? `<span class="badge badge-version">v${escapeHtml(crash.app_version)}</span>` : ''}
+                                ${crash.release ? `<span>Release: ${escapeHtml(crash.release)}</span>` : ''}
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        function renderGroups() {
+            const content = document.getElementById('content');
+
+            if (groups.length === 0) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <h2>No crash groups</h2>
+                        <p>Crashes will be grouped by exception type.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            content.innerHTML = `
+                <div class="crash-list">
+                    ${groups.map(group => `
+                        <div class="group-item">
+                            <div class="group-info">
+                                <div class="crash-type">${escapeHtml(group.exception_type)}</div>
+                                <div class="crash-meta">
+                                    <span>First: ${formatTime(group.first_seen)}</span>
+                                    <span>Last: ${formatTime(group.last_seen)}</span>
+                                </div>
+                                <div class="group-versions">
+                                    ${group.app_versions.filter(v => v).map(v =>
+                                        `<span class="badge badge-version">v${escapeHtml(v)}</span>`
+                                    ).join('')}
+                                </div>
+                            </div>
+                            <div class="group-count">${group.count}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        async function showCrash(id) {
+            const crash = crashes.find(c => c.id === id);
+            if (!crash) return;
+
+            document.getElementById('modal-type').textContent = crash.exception_type || 'Unknown Error';
+            document.getElementById('modal-body').innerHTML = `
+                <div class="detail-section">
+                    <h3>Message</h3>
+                    <p>${escapeHtml(crash.message || 'No message')}</p>
+                </div>
+
+                <div class="detail-section">
+                    <h3>Stack Trace</h3>
+                    <pre class="stack-trace">${escapeHtml(crash.stack_trace || crash.raw_content || 'No stack trace')}</pre>
+                </div>
+
+                <div class="detail-section">
+                    <h3>Details</h3>
+                    <div class="detail-grid">
+                        <div class="detail-item">
+                            <label>Event ID</label>
+                            <span>${escapeHtml(crash.event_id)}</span>
+                        </div>
+                        <div class="detail-item">
+                            <label>Received</label>
+                            <span>${formatTime(crash.received_at)}</span>
+                        </div>
+                        <div class="detail-item">
+                            <label>Sender</label>
+                            <span>${escapeHtml(crash.sender_pubkey.slice(0, 16))}...</span>
+                        </div>
+                        ${crash.environment ? `
+                        <div class="detail-item">
+                            <label>Environment</label>
+                            <span>${escapeHtml(crash.environment)}</span>
+                        </div>` : ''}
+                        ${crash.release ? `
+                        <div class="detail-item">
+                            <label>Release</label>
+                            <span>${escapeHtml(crash.release)}</span>
+                        </div>` : ''}
+                        ${crash.app_version ? `
+                        <div class="detail-item">
+                            <label>App Version</label>
+                            <span>${escapeHtml(crash.app_version)}</span>
+                        </div>` : ''}
+                    </div>
+                </div>
+            `;
+            document.getElementById('modal').classList.add('open');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('open');
+        }
+
+        function formatTime(timestamp) {
+            const date = new Date(timestamp * 1000);
+            const now = new Date();
+            const diff = now - date;
+
+            if (diff < 60000) return 'just now';
+            if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+            if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+            if (diff < 604800000) return `${Math.floor(diff / 86400000)}d ago`;
+
+            return date.toLocaleDateString();
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                currentView = tab.dataset.view;
+                render();
+            });
+        });
+
+        // Close modal on escape or click outside
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') closeModal();
+        });
+        document.getElementById('modal').addEventListener('click', e => {
+            if (e.target.id === 'modal') closeModal();
+        });
+
+        // Auto-refresh every 30 seconds
+        setInterval(async () => {
+            await Promise.all([fetchCrashes(), fetchGroups(), fetchStats()]);
+            render();
+        }, 30000);
+
+        init();
+    </script>
+</body>
+</html>
