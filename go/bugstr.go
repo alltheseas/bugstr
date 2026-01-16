@@ -3,6 +3,11 @@
 // Bugstr delivers crash reports via Nostr gift-wrapped encrypted direct messages
 // with user consent. Reports auto-expire after 30 days.
 //
+// For large crash reports (>50KB), uses CHK chunking:
+//   - Chunks are published as public events (kind 10422)
+//   - Manifest with root hash is gift-wrapped (kind 10421)
+//   - Only the recipient can decrypt chunks using the root hash
+//
 // Basic usage:
 //
 //	bugstr.Init(bugstr.Config{
@@ -17,12 +22,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"io"
+	mathrand "math/rand"
 	"regexp"
 	"runtime"
 	"strings"
@@ -32,7 +40,98 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/nbd-wtf/go-nostr/nip44"
+	"golang.org/x/crypto/hkdf"
 )
+
+// Transport layer constants
+const (
+	// KindDirect is the event kind for direct crash report delivery (<=50KB).
+	KindDirect = 10420
+	// KindManifest is the event kind for hashtree manifest (>50KB crash reports).
+	KindManifest = 10421
+	// KindChunk is the event kind for CHK-encrypted chunk data.
+	KindChunk = 10422
+	// DirectSizeThreshold is the size threshold for switching to chunked transport (50KB).
+	DirectSizeThreshold = 50 * 1024
+	// MaxChunkSize is the maximum chunk size (48KB).
+	MaxChunkSize = 48 * 1024
+	// DefaultRelayRateLimit is the rate limit for strfry+noteguard relays (8 posts/min = 7500ms).
+	DefaultRelayRateLimit = 7500 * time.Millisecond
+)
+
+// RelayRateLimits contains known relay rate limits.
+var RelayRateLimits = map[string]time.Duration{
+	"wss://relay.damus.io":   7500 * time.Millisecond,
+	"wss://nos.lol":          7500 * time.Millisecond,
+	"wss://relay.primal.net": 7500 * time.Millisecond,
+}
+
+// GetRelayRateLimit returns the rate limit for a relay URL.
+func GetRelayRateLimit(relayURL string) time.Duration {
+	if limit, ok := RelayRateLimits[relayURL]; ok {
+		return limit
+	}
+	return DefaultRelayRateLimit
+}
+
+// EstimateUploadSeconds estimates upload time for given chunks and relays.
+func EstimateUploadSeconds(totalChunks, numRelays int) int {
+	msPerChunk := int(DefaultRelayRateLimit.Milliseconds()) / numRelays
+	return (totalChunks * msPerChunk) / 1000
+}
+
+// ProgressPhase represents the current phase of upload.
+type ProgressPhase string
+
+const (
+	ProgressPhasePreparing  ProgressPhase = "preparing"
+	ProgressPhaseUploading  ProgressPhase = "uploading"
+	ProgressPhaseFinalizing ProgressPhase = "finalizing"
+)
+
+// Progress represents upload progress for HIG-compliant UI.
+type Progress struct {
+	Phase                    ProgressPhase
+	CurrentChunk             int
+	TotalChunks              int
+	FractionCompleted        float64
+	EstimatedSecondsRemaining int
+	LocalizedDescription     string
+}
+
+// ProgressCallback is called with upload progress.
+type ProgressCallback func(Progress)
+
+// DirectPayload wraps crash data for direct delivery (kind 10420).
+type DirectPayload struct {
+	V     int         `json:"v"`
+	Crash interface{} `json:"crash"`
+}
+
+// ManifestPayload contains metadata for chunked crash reports (kind 10421).
+type ManifestPayload struct {
+	V           int                 `json:"v"`
+	RootHash    string              `json:"root_hash"`
+	TotalSize   int                 `json:"total_size"`
+	ChunkCount  int                 `json:"chunk_count"`
+	ChunkIDs    []string            `json:"chunk_ids"`
+	ChunkRelays map[string][]string `json:"chunk_relays,omitempty"`
+}
+
+// ChunkPayload contains encrypted chunk data (kind 10422).
+type ChunkPayload struct {
+	V     int    `json:"v"`
+	Index int    `json:"index"`
+	Hash  string `json:"hash"`
+	Data  string `json:"data"`
+}
+
+// ChunkData holds chunked data before publishing.
+type ChunkData struct {
+	Index     int
+	Hash      []byte
+	Encrypted []byte
+}
 
 // Config holds the Bugstr configuration.
 type Config struct {
@@ -60,6 +159,10 @@ type Config struct {
 	// ConfirmSend prompts the user before sending. Return true to send.
 	// If nil, reports are sent automatically (suitable for servers).
 	ConfirmSend func(summary Summary) bool
+
+	// OnProgress is called with upload progress for large crash reports.
+	// Fires asynchronously - does not block the main goroutine.
+	OnProgress ProgressCallback
 }
 
 // Payload is the crash report data sent to the developer.
@@ -85,11 +188,13 @@ type CompressedEnvelope struct {
 }
 
 var (
-	config           Config
-	senderPrivkey    string
+	config             Config
+	senderPrivkey      string
 	developerPubkeyHex string
-	initialized      bool
-	initMu           sync.Mutex
+	initialized        bool
+	initMu             sync.Mutex
+	lastPostTime       = make(map[string]time.Time)
+	lastPostTimeMu     sync.Mutex
 
 	defaultRelays = []string{"wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"}
 
@@ -261,8 +366,102 @@ func truncateStack(stack string, lines int) string {
 func randomPastTimestamp() int64 {
 	now := time.Now().Unix()
 	maxOffset := int64(60 * 60 * 24 * 2) // up to 2 days
-	offset := rand.Int63n(maxOffset)
+	offset := mathrand.Int63n(maxOffset)
 	return now - offset
+}
+
+// HKDF salt for CHK derivation (must match hashtree-core)
+var chkSalt = []byte("hashtree-chk")
+
+// HKDF info for key derivation (must match hashtree-core)
+var chkInfo = []byte("encryption-key")
+
+// Nonce size for AES-GCM (96 bits)
+const nonceSize = 12
+
+// deriveKey derives encryption key from content hash using HKDF-SHA256.
+// Must match hashtree-core: HKDF(content_hash, salt="hashtree-chk", info="encryption-key")
+func deriveKey(contentHash []byte) ([]byte, error) {
+	hkdfReader := hkdf.New(sha256.New, contentHash, chkSalt, chkInfo)
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// chkEncrypt encrypts data using AES-256-GCM with zero nonce (CHK-safe).
+// Returns: [ciphertext][16-byte auth tag]
+//
+// Zero nonce is safe for CHK because same key = same content (convergent encryption).
+//
+// **CRITICAL**: Must match hashtree-core crypto exactly:
+// - Key derivation: HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
+// - Cipher: AES-256-GCM with 12-byte zero nonce
+// - Format: [ciphertext][16-byte auth tag]
+func chkEncrypt(data, contentHash []byte) ([]byte, error) {
+	key, err := deriveKey(contentHash)
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Zero nonce is safe for CHK (same key = same content)
+	zeroNonce := make([]byte, nonceSize)
+
+	// GCM Seal appends auth tag to ciphertext
+	return gcm.Seal(nil, zeroNonce, data, nil), nil
+}
+
+// chunkPayloadData splits data into chunks and encrypts each using CHK.
+func chunkPayloadData(data []byte) (rootHash string, chunks []ChunkData, err error) {
+	var chunkHashes [][]byte
+
+	offset := 0
+	index := 0
+	for offset < len(data) {
+		end := offset + MaxChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunkData := data[offset:end]
+
+		// Compute hash of plaintext chunk (becomes encryption key)
+		hash := sha256.Sum256(chunkData)
+		chunkHashes = append(chunkHashes, hash[:])
+
+		// Encrypt chunk using its hash as key
+		encrypted, err := chkEncrypt(chunkData, hash[:])
+		if err != nil {
+			return "", nil, err
+		}
+
+		chunks = append(chunks, ChunkData{
+			Index:     index,
+			Hash:      hash[:],
+			Encrypted: encrypted,
+		})
+
+		offset = end
+		index++
+	}
+
+	// Compute root hash from all chunk hashes
+	var rootHashInput []byte
+	for _, h := range chunkHashes {
+		rootHashInput = append(rootHashInput, h...)
+	}
+	rootHashBytes := sha256.Sum256(rootHashInput)
+	return hex.EncodeToString(rootHashBytes[:]), chunks, nil
 }
 
 func maybeCompress(plaintext string) string {
@@ -285,6 +484,239 @@ func maybeCompress(plaintext string) string {
 	return string(result)
 }
 
+// buildGiftWrap creates a NIP-17 gift-wrapped event for a rumor.
+func buildGiftWrap(rumorKind int, content string) (nostr.Event, error) {
+	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
+
+	// NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
+	rumor := map[string]interface{}{
+		"id":         "",
+		"pubkey":     senderPubkey,
+		"created_at": time.Now().Unix(),
+		"kind":       rumorKind,
+		"tags":       [][]string{{"p", developerPubkeyHex}},
+		"content":    content,
+		"sig":        "",
+	}
+
+	serialized, _ := json.Marshal([]interface{}{
+		0,
+		rumor["pubkey"],
+		rumor["created_at"],
+		rumor["kind"],
+		rumor["tags"],
+		rumor["content"],
+	})
+	hash := sha256.Sum256(serialized)
+	rumor["id"] = hex.EncodeToString(hash[:])
+
+	rumorBytes, _ := json.Marshal(rumor)
+	conversationKey, err := nip44.GenerateConversationKey(senderPrivkey, developerPubkeyHex)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+	sealContent, err := nip44.Encrypt(string(rumorBytes), conversationKey)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	seal := nostr.Event{
+		Kind:      13,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{},
+		Content:   sealContent,
+	}
+	seal.Sign(senderPrivkey)
+
+	wrapperPrivkey := nostr.GeneratePrivateKey()
+	wrapKey, err := nip44.GenerateConversationKey(wrapperPrivkey, developerPubkeyHex)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	sealJSON, _ := json.Marshal(seal)
+	giftContent, err := nip44.Encrypt(string(sealJSON), wrapKey)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+
+	giftWrap := nostr.Event{
+		Kind:      1059,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{{"p", developerPubkeyHex}},
+		Content:   giftContent,
+	}
+	giftWrap.Sign(wrapperPrivkey)
+
+	return giftWrap, nil
+}
+
+// buildChunkEvent creates a public chunk event (kind 10422).
+func buildChunkEvent(chunk ChunkData) nostr.Event {
+	chunkPrivkey := nostr.GeneratePrivateKey()
+	chunkPayload := ChunkPayload{
+		V:     1,
+		Index: chunk.Index,
+		Hash:  hex.EncodeToString(chunk.Hash),
+		Data:  base64.StdEncoding.EncodeToString(chunk.Encrypted),
+	}
+	content, _ := json.Marshal(chunkPayload)
+
+	event := nostr.Event{
+		Kind:      KindChunk,
+		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
+		Tags:      nostr.Tags{},
+		Content:   string(content),
+	}
+	event.Sign(chunkPrivkey)
+	return event
+}
+
+// publishToRelays publishes an event to the first successful relay.
+func publishToRelays(ctx context.Context, relays []string, event nostr.Event) error {
+	var lastErr error
+	for _, relayURL := range relays {
+		relay, err := nostr.RelayConnect(ctx, relayURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		err = relay.Publish(ctx, event)
+		relay.Close()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// publishToAllRelays publishes an event to all relays for redundancy.
+func publishToAllRelays(ctx context.Context, relays []string, event nostr.Event) error {
+	var wg sync.WaitGroup
+	successCount := 0
+	var mu sync.Mutex
+
+	for _, relayURL := range relays {
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			relay, err := nostr.RelayConnect(ctx, url)
+			if err != nil {
+				return
+			}
+			err = relay.Publish(ctx, event)
+			relay.Close()
+			if err == nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(relayURL)
+	}
+
+	wg.Wait()
+	if successCount == 0 {
+		return fmt.Errorf("failed to publish chunk to any relay")
+	}
+	return nil
+}
+
+// waitForRateLimit waits until enough time has passed since the last post to this relay.
+func waitForRateLimit(relayURL string) {
+	// Compute sleep duration while holding lock to avoid race condition
+	lastPostTimeMu.Lock()
+	lastTime, exists := lastPostTime[relayURL]
+	var sleepDuration time.Duration
+	if exists {
+		rateLimit := GetRelayRateLimit(relayURL)
+		deadline := lastTime.Add(rateLimit)
+		sleepDuration = time.Until(deadline)
+	}
+	lastPostTimeMu.Unlock()
+
+	// Sleep outside of lock
+	if sleepDuration > 0 {
+		time.Sleep(sleepDuration)
+	}
+}
+
+// recordPostTime records the time of a post to a relay.
+func recordPostTime(relayURL string) {
+	lastPostTimeMu.Lock()
+	lastPostTime[relayURL] = time.Now()
+	lastPostTimeMu.Unlock()
+}
+
+// publishChunkToRelay publishes a chunk to a single relay with rate limiting.
+func publishChunkToRelay(ctx context.Context, relayURL string, event nostr.Event) error {
+	waitForRateLimit(relayURL)
+
+	relay, err := nostr.RelayConnect(ctx, relayURL)
+	if err != nil {
+		return err
+	}
+	defer relay.Close()
+
+	err = relay.Publish(ctx, event)
+	if err == nil {
+		recordPostTime(relayURL)
+	}
+	return err
+}
+
+// verifyChunkExists queries a relay to verify a chunk event exists.
+func verifyChunkExists(ctx context.Context, relayURL string, eventID string) bool {
+	verifyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	relay, err := nostr.RelayConnect(verifyCtx, relayURL)
+	if err != nil {
+		return false
+	}
+	defer relay.Close()
+
+	filter := nostr.Filter{
+		IDs:   []string{eventID},
+		Kinds: []int{KindChunk},
+		Limit: 1,
+	}
+
+	events, err := relay.QuerySync(verifyCtx, filter)
+	if err != nil {
+		return false
+	}
+
+	return len(events) > 0
+}
+
+// publishChunkWithVerify publishes a chunk and verifies it was stored.
+// Returns the relay URL where the chunk was successfully published, or error.
+func publishChunkWithVerify(ctx context.Context, relays []string, startIndex int, event nostr.Event) (string, error) {
+	numRelays := len(relays)
+
+	// Try each relay starting from startIndex (round-robin)
+	for attempt := 0; attempt < numRelays; attempt++ {
+		relayURL := relays[(startIndex+attempt)%numRelays]
+
+		// Publish with rate limiting
+		if err := publishChunkToRelay(ctx, relayURL, event); err != nil {
+			continue // Try next relay
+		}
+
+		// Brief delay before verification to allow relay to process
+		time.Sleep(500 * time.Millisecond)
+
+		// Verify the chunk exists on the relay
+		if verifyChunkExists(ctx, relayURL, event.ID) {
+			return relayURL, nil
+		}
+		// Verification failed, try next relay
+	}
+
+	return "", fmt.Errorf("failed to publish and verify chunk on any relay")
+}
+
 func sendToNostr(ctx context.Context, payload *Payload) error {
 	relays := config.Relays
 	if len(relays) == 0 {
@@ -297,87 +729,116 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 	}
 
 	content := maybeCompress(string(plaintext))
-	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
+	payloadSize := len(content)
 
-	// Build unsigned kind 14 rumor
-	rumor := map[string]interface{}{
-		"id":         "", // Computed later
-		"pubkey":     senderPubkey,
-		"created_at": randomPastTimestamp(),
-		"kind":       14,
-		"tags":       [][]string{{"p", developerPubkeyHex}},
-		"content":    content,
-		"sig":        "",
-	}
+	if payloadSize <= DirectSizeThreshold {
+		// Small payload: direct gift-wrapped delivery
+		directPayload := DirectPayload{V: 1, Crash: payload}
+		directContent, _ := json.Marshal(directPayload)
 
-	// Compute rumor ID per NIP-01: sha256 of [0, pubkey, created_at, kind, tags, content]
-	serialized, _ := json.Marshal([]interface{}{
-		0,
-		rumor["pubkey"],
-		rumor["created_at"],
-		rumor["kind"],
-		rumor["tags"],
-		rumor["content"],
-	})
-	hash := sha256.Sum256(serialized)
-	rumorID := hex.EncodeToString(hash[:])
-	rumor["id"] = rumorID
-
-	// Encrypt rumor into seal
-	rumorBytes, _ := json.Marshal(rumor)
-	conversationKey, err := nip44.GenerateConversationKey(senderPrivkey, developerPubkeyHex)
-	if err != nil {
-		return err
-	}
-	sealContent, err := nip44.Encrypt(string(rumorBytes), conversationKey)
-	if err != nil {
-		return err
-	}
-
-	seal := nostr.Event{
-		Kind:      13,
-		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
-		Tags:      nostr.Tags{},
-		Content:   sealContent,
-	}
-	seal.Sign(senderPrivkey)
-
-	// Wrap seal in gift wrap with random key
-	wrapperPrivkey := nostr.GeneratePrivateKey()
-	wrapKey, err := nip44.GenerateConversationKey(wrapperPrivkey, developerPubkeyHex)
-	if err != nil {
-		return err
-	}
-
-	sealJSON, _ := json.Marshal(seal)
-	giftContent, err := nip44.Encrypt(string(sealJSON), wrapKey)
-	if err != nil {
-		return err
-	}
-
-	giftWrap := nostr.Event{
-		Kind:      1059,
-		CreatedAt: nostr.Timestamp(randomPastTimestamp()),
-		Tags:      nostr.Tags{{"p", developerPubkeyHex}},
-		Content:   giftContent,
-	}
-	giftWrap.Sign(wrapperPrivkey)
-
-	// Publish to relays
-	var lastErr error
-	for _, relayURL := range relays {
-		relay, err := nostr.RelayConnect(ctx, relayURL)
+		giftWrap, err := buildGiftWrap(KindDirect, string(directContent))
 		if err != nil {
-			lastErr = err
-			continue
+			return err
 		}
-		err = relay.Publish(ctx, giftWrap)
-		relay.Close()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
+
+		return publishToRelays(ctx, relays, giftWrap)
 	}
 
-	return lastErr
+	// Large payload: chunked delivery with round-robin distribution
+	rootHash, chunks, err := chunkPayloadData([]byte(content))
+	if err != nil {
+		return err
+	}
+
+	totalChunks := len(chunks)
+	numRelays := len(relays)
+
+	// Report initial progress
+	if config.OnProgress != nil {
+		estimatedSeconds := EstimateUploadSeconds(totalChunks, numRelays)
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhasePreparing,
+			CurrentChunk:             0,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        0,
+			EstimatedSecondsRemaining: estimatedSeconds,
+			LocalizedDescription:     "Preparing crash report...",
+		})
+	}
+
+	// Build and publish chunk events with round-robin distribution and verification
+	chunkIDs := make([]string, totalChunks)
+	chunkRelays := make(map[string][]string)
+
+	for i, chunk := range chunks {
+		chunkEvent := buildChunkEvent(chunk)
+		chunkIDs[i] = chunkEvent.ID
+
+		// Publish with verification and retry (starts at round-robin relay)
+		successRelay, err := publishChunkWithVerify(ctx, relays, i%numRelays, chunkEvent)
+		if err != nil {
+			// All relays failed for this chunk - abort to avoid partial/broken manifest
+			log.Printf("Failed to publish chunk %d/%d (id: %s): %v", i, totalChunks, chunkEvent.ID, err)
+			return fmt.Errorf("failed to publish chunk %d to any relay after retries: %w", i, err)
+		}
+		chunkRelays[chunkEvent.ID] = []string{successRelay}
+
+		// Report progress
+		if config.OnProgress != nil {
+			remainingChunks := totalChunks - i - 1
+			remainingSeconds := EstimateUploadSeconds(remainingChunks, numRelays)
+			config.OnProgress(Progress{
+				Phase:                    ProgressPhaseUploading,
+				CurrentChunk:             i + 1,
+				TotalChunks:              totalChunks,
+				FractionCompleted:        float64(i+1) / float64(totalChunks) * 0.95,
+				EstimatedSecondsRemaining: remainingSeconds,
+				LocalizedDescription:     fmt.Sprintf("Uploading chunk %d of %d", i+1, totalChunks),
+			})
+		}
+	}
+
+	// Report finalizing
+	if config.OnProgress != nil {
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhaseFinalizing,
+			CurrentChunk:             totalChunks,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        0.95,
+			EstimatedSecondsRemaining: 2,
+			LocalizedDescription:     "Finalizing...",
+		})
+	}
+
+	// Build and publish manifest with relay hints
+	manifest := ManifestPayload{
+		V:           1,
+		RootHash:    rootHash,
+		TotalSize:   len(content),
+		ChunkCount:  totalChunks,
+		ChunkIDs:    chunkIDs,
+		ChunkRelays: chunkRelays,
+	}
+	manifestContent, _ := json.Marshal(manifest)
+
+	manifestGiftWrap, err := buildGiftWrap(KindManifest, string(manifestContent))
+	if err != nil {
+		return err
+	}
+
+	err = publishToRelays(ctx, relays, manifestGiftWrap)
+
+	// Report complete
+	if err == nil && config.OnProgress != nil {
+		config.OnProgress(Progress{
+			Phase:                    ProgressPhaseFinalizing,
+			CurrentChunk:             totalChunks,
+			TotalChunks:              totalChunks,
+			FractionCompleted:        1.0,
+			EstimatedSecondsRemaining: 0,
+			LocalizedDescription:     "Complete",
+		})
+	}
+
+	return err
 }

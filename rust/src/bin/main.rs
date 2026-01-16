@@ -6,6 +6,8 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
+    is_crash_report_kind, is_chunked_kind, DirectPayload, ManifestPayload, ChunkPayload,
+    reassemble_payload, KIND_CHUNK,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -474,15 +476,19 @@ async fn serve(
     // Channel for received crashes
     let (tx, mut rx) = mpsc::channel::<ReceivedCrash>(100);
 
+    // Clone relay list for chunk fetching (need all relays available to each listener)
+    let all_relays: Vec<String> = relays.iter().cloned().collect();
+
     // Spawn relay listeners
     for relay_url in relays {
         let relay = relay_url.clone();
         let keys = keys.clone();
         let tx = tx.clone();
+        let relay_urls = all_relays.clone();
 
         tokio::spawn(async move {
             loop {
-                match subscribe_relay_with_storage(&relay, &keys, &tx).await {
+                match subscribe_relay_with_storage(&relay, &keys, &tx, &relay_urls).await {
                     Ok(()) => {}
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -553,6 +559,7 @@ async fn subscribe_relay_with_storage(
     relay_url: &str,
     keys: &Keys,
     tx: &mpsc::Sender<ReceivedCrash>,
+    all_relay_urls: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut seen: HashSet<EventId> = HashSet::new();
     let (ws_stream, _) = connect_async(relay_url).await?;
@@ -577,7 +584,7 @@ async fn subscribe_relay_with_storage(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Some(crash) = handle_message_for_storage(&text, keys, &mut seen) {
+                if let Some(crash) = handle_message_for_storage(&text, keys, &mut seen, all_relay_urls).await {
                     if tx.send(crash).await.is_err() {
                         break;
                     }
@@ -598,11 +605,271 @@ async fn subscribe_relay_with_storage(
     Ok(())
 }
 
+/// Fetch chunk events from relays by their event IDs.
+///
+/// Uses relay hints from the manifest when available to optimize fetching.
+/// For each chunk, tries the hinted relay first before falling back to all relays.
+///
+/// # Arguments
+///
+/// * `relay_urls` - List of relay WebSocket URLs to query (fallback)
+/// * `chunk_ids` - Event IDs of chunks to fetch (hex-encoded)
+/// * `chunk_relays` - Optional map of chunk ID to relay hints from manifest
+///
+/// # Returns
+///
+/// Vector of `ChunkPayload` in order by index, ready for reassembly.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Any chunk ID is not valid hex
+/// - Not all chunks could be fetched from all relays combined
+/// - A chunk is missing at a specific index
+async fn fetch_chunks(
+    relay_urls: &[String],
+    chunk_ids: &[String],
+    chunk_relays: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Result<Vec<ChunkPayload>, Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Parse event IDs
+    let event_ids: Vec<EventId> = chunk_ids
+        .iter()
+        .filter_map(|id| EventId::from_hex(id).ok())
+        .collect();
+
+    if event_ids.len() != chunk_ids.len() {
+        return Err("Invalid chunk event IDs in manifest".into());
+    }
+
+    let expected_count = chunk_ids.len();
+    let chunks: Arc<TokioMutex<HashMap<u32, ChunkPayload>>> = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // Determine if we have relay hints
+    let has_hints = chunk_relays.map(|h| !h.is_empty()).unwrap_or(false);
+
+    if has_hints {
+        println!("  {} Fetching {} chunks using relay hints", "↓".blue(), expected_count);
+
+        // Phase 1: Try hinted relays first (grouped by relay for efficiency)
+        let mut relay_to_chunks: HashMap<String, Vec<(usize, EventId)>> = HashMap::new();
+
+        for (i, chunk_id) in chunk_ids.iter().enumerate() {
+            if let Some(hints) = chunk_relays.and_then(|h| h.get(chunk_id)) {
+                if let Some(relay) = hints.first() {
+                    relay_to_chunks
+                        .entry(relay.clone())
+                        .or_default()
+                        .push((i, event_ids[i]));
+                }
+            }
+        }
+
+        // Spawn parallel fetch tasks for hinted relays
+        let mut handles = Vec::new();
+        for (relay_url, chunk_indices) in relay_to_chunks {
+            let relay = relay_url.clone();
+            let ids: Vec<EventId> = chunk_indices.iter().map(|(_, id)| *id).collect();
+            let chunks_clone = Arc::clone(&chunks);
+            let expected = expected_count;
+
+            let handle = tokio::spawn(async move {
+                fetch_chunks_from_relay(&relay, &ids, chunks_clone, expected).await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for hinted relay fetches
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        // Check if we got all chunks from hinted relays
+        let current_count = chunks.lock().await.len();
+        if current_count == expected_count {
+            println!("  {} All {} chunks retrieved from hinted relays", "✓".green(), expected_count);
+            let final_chunks = chunks.lock().await;
+            let mut ordered: Vec<ChunkPayload> = Vec::with_capacity(expected_count);
+            for i in 0..expected_count {
+                match final_chunks.get(&(i as u32)) {
+                    Some(chunk) => ordered.push(chunk.clone()),
+                    None => return Err(format!("Missing chunk at index {}", i).into()),
+                }
+            }
+            return Ok(ordered);
+        }
+
+        // Phase 2: Fall back to all relays for missing chunks
+        let missing = expected_count - current_count;
+        println!("  {} {} chunks missing, falling back to all relays", "↓".blue(), missing);
+    } else {
+        println!("  {} Fetching {} chunks from {} relays in parallel", "↓".blue(), expected_count, relay_urls.len());
+    }
+
+    // Spawn parallel fetch tasks for all relays (for missing chunks or no hints)
+    let mut handles = Vec::new();
+    for relay_url in relay_urls {
+        let relay = relay_url.clone();
+        let ids = event_ids.clone();
+        let chunks_clone = Arc::clone(&chunks);
+        let expected = expected_count;
+
+        let handle = tokio::spawn(async move {
+            fetch_chunks_from_relay(&relay, &ids, chunks_clone, expected).await
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all relay fetches to complete
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Extract results
+    let final_chunks = chunks.lock().await;
+
+    // Check we got all chunks
+    if final_chunks.len() != expected_count {
+        return Err(format!(
+            "Missing chunks: got {}, expected {} (aggregated across {} relays)",
+            final_chunks.len(),
+            expected_count,
+            relay_urls.len()
+        ).into());
+    }
+
+    // Return chunks in order
+    let mut ordered: Vec<ChunkPayload> = Vec::with_capacity(expected_count);
+    for i in 0..expected_count {
+        match final_chunks.get(&(i as u32)) {
+            Some(chunk) => ordered.push(chunk.clone()),
+            None => return Err(format!("Missing chunk at index {}", i).into()),
+        }
+    }
+
+    println!("  {} All {} chunks retrieved", "✓".green(), expected_count);
+    Ok(ordered)
+}
+
+/// Fetch chunks from a single relay into the shared chunks map.
+async fn fetch_chunks_from_relay(
+    relay_url: &str,
+    event_ids: &[EventId],
+    chunks: Arc<tokio::sync::Mutex<std::collections::HashMap<u32, ChunkPayload>>>,
+    expected_count: usize,
+) {
+    use tokio::time::{timeout, Duration};
+
+    let connect_result = timeout(Duration::from_secs(10), connect_async(relay_url)).await;
+    let (ws_stream, _) = match connect_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            eprintln!("    {} {}: connect failed: {}", "⚠".yellow(), relay_url, e);
+            return;
+        }
+        Err(_) => {
+            eprintln!("    {} {}: connect timeout", "⚠".yellow(), relay_url);
+            return;
+        }
+    };
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Check which chunks we still need
+    let needed: Vec<EventId> = {
+        let current = chunks.lock().await;
+        event_ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !current.contains_key(&(*i as u32)))
+            .map(|(_, id)| *id)
+            .collect()
+    };
+
+    if needed.is_empty() {
+        return;
+    }
+
+    let filter = Filter::new()
+        .ids(needed)
+        .kind(Kind::Custom(KIND_CHUNK));
+
+    // Safely extract relay identifier, handling both wss:// and ws:// schemes
+    let relay_suffix = relay_url
+        .strip_prefix("wss://")
+        .or_else(|| relay_url.strip_prefix("ws://"))
+        .unwrap_or(relay_url);
+    let subscription_id = format!("bugstr-{}", relay_suffix.chars().take(8).collect::<String>());
+    let req = format!(
+        r#"["REQ","{}",{}]"#,
+        subscription_id,
+        serde_json::to_string(&filter).unwrap_or_default()
+    );
+
+    if write.send(Message::Text(req.into())).await.is_err() {
+        return;
+    }
+
+    // Read events with timeout
+    let fetch_timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < fetch_timeout {
+        // Check if we have all chunks (another relay might have found them)
+        if chunks.lock().await.len() >= expected_count {
+            break;
+        }
+
+        let msg_result = timeout(Duration::from_secs(5), read.next()).await;
+
+        match msg_result {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let msg: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                if msg.len() >= 3 && msg[0].as_str() == Some("EVENT") {
+                    if let Ok(event) = serde_json::from_value::<Event>(msg[2].clone()) {
+                        if let Ok(chunk) = ChunkPayload::from_json(&event.content) {
+                            let index = chunk.index;
+                            let mut current = chunks.lock().await;
+                            if !current.contains_key(&index) {
+                                current.insert(index, chunk);
+                                println!("    {} {} chunk {}/{}", "✓".green(), relay_url, current.len(), expected_count);
+                            }
+                        }
+                    }
+                } else if msg.len() >= 2 && msg[0].as_str() == Some("EOSE") {
+                    break;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) => break,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    // Close subscription
+    let close_msg = format!(r#"["CLOSE","{}"]"#, subscription_id);
+    let _ = write.send(Message::Text(close_msg.into())).await;
+}
+
 /// Handle incoming message and return crash for storage.
-fn handle_message_for_storage(
+async fn handle_message_for_storage(
     text: &str,
     keys: &Keys,
     seen: &mut HashSet<EventId>,
+    relay_urls: &[String],
 ) -> Option<ReceivedCrash> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
 
@@ -639,8 +906,83 @@ fn handle_message_for_storage(
         }
     };
 
-    // Decompress if needed
-    let content = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
+    let rumor_kind = rumor.kind as u16;
+
+    // Decompress payload once before any parsing (handles both compressed manifests and direct payloads)
+    let decompressed = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
+
+    // Handle different transport kinds
+    if is_chunked_kind(rumor_kind) {
+        // Kind 10421: Manifest for chunked crash report
+        match ManifestPayload::from_json(&decompressed) {
+            Ok(manifest) => {
+                println!(
+                    "{} Received manifest: {} chunks, {} bytes total",
+                    "📦".cyan(),
+                    manifest.chunk_count,
+                    manifest.total_size
+                );
+
+                // Fetch chunks from relays (using relay hints if available)
+                let chunks = match fetch_chunks(
+                    relay_urls,
+                    &manifest.chunk_ids,
+                    manifest.chunk_relays.as_ref(),
+                ).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} Failed to fetch chunks: {}", "✗".red(), e);
+                        return None;
+                    }
+                };
+
+                // Reassemble the payload
+                let reassembled = match reassemble_payload(&manifest, &chunks) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("{} Failed to reassemble payload: {}", "✗".red(), e);
+                        return None;
+                    }
+                };
+
+                // Decompress reassembled data
+                let payload_str = String::from_utf8_lossy(&reassembled);
+                let decompressed = decompress_payload(&payload_str)
+                    .unwrap_or_else(|_| payload_str.to_string());
+
+                println!("{} Reassembled {} bytes from {} chunks", "✓".green(), decompressed.len(), chunks.len());
+
+                return Some(ReceivedCrash {
+                    event_id: event.id.to_hex(),
+                    sender_pubkey: rumor.pubkey.clone(),
+                    created_at: rumor.created_at as i64,
+                    content: decompressed,
+                });
+            }
+            Err(e) => {
+                eprintln!("{} Failed to parse manifest: {}", "✗".red(), e);
+                return None;
+            }
+        }
+    }
+
+    // Extract crash content based on transport kind (decompressed already computed above)
+    let content = if is_crash_report_kind(rumor_kind) {
+        // Kind 10420: Direct crash report with DirectPayload wrapper
+        match DirectPayload::from_json(&decompressed) {
+            Ok(direct) => {
+                // Convert JSON value to string for storage
+                serde_json::to_string(&direct.crash).unwrap_or(decompressed)
+            }
+            Err(_) => {
+                // Fall back to treating content as raw crash data
+                decompressed
+            }
+        }
+    } else {
+        // Legacy kind 14 or other: treat content as raw crash data
+        decompressed
+    };
 
     Some(ReceivedCrash {
         event_id: event.id.to_hex(),
@@ -799,13 +1141,43 @@ struct Rumor {
 }
 
 fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<Rumor, Box<dyn std::error::Error>> {
+    // Verify gift wrap signature (NIP-59: gift wrap is signed by random keypair)
+    gift_wrap.verify()?;
+
     // Decrypt gift wrap to get seal
     let seal_json = nip44::decrypt(keys.secret_key(), &gift_wrap.pubkey, &gift_wrap.content)?;
     let seal: Event = serde_json::from_str(&seal_json)?;
 
+    // Verify seal kind (NIP-59: seal MUST be kind 13)
+    if seal.kind != Kind::Seal {
+        return Err(format!("Invalid seal kind: expected 13, got {}", seal.kind.as_u16()).into());
+    }
+
+    // Verify seal tags are empty (NIP-59: seal tags MUST be empty)
+    if !seal.tags.is_empty() {
+        return Err("Invalid seal: tags must be empty".into());
+    }
+
+    // Verify seal signature (NIP-59: seal is signed by sender)
+    seal.verify()?;
+
     // Decrypt seal to get rumor (unsigned, so parse as Rumor not Event)
     let rumor_json = nip44::decrypt(keys.secret_key(), &seal.pubkey, &seal.content)?;
     let rumor: Rumor = serde_json::from_str(&rumor_json)?;
+
+    // Verify rumor sig is empty (NIP-59: rumors are unsigned)
+    if !rumor.sig.is_empty() {
+        return Err("Invalid rumor: sig must be empty".into());
+    }
+
+    // Verify seal.pubkey matches rumor.pubkey (NIP-17: prevent sender spoofing)
+    if seal.pubkey.to_hex() != rumor.pubkey {
+        return Err(format!(
+            "Sender spoofing detected: seal.pubkey ({}) != rumor.pubkey ({})",
+            &seal.pubkey.to_hex()[..16],
+            &rumor.pubkey[..16]
+        ).into());
+    }
 
     Ok(rumor)
 }

@@ -41,6 +41,8 @@
     "access": "public"
   },
   "dependencies": {
+    "@noble/ciphers": "^1.0.0",
+    "@noble/hashes": "^1.6.0",
     "nostr-tools": "^2.10.0"
   },
   "devDependencies": {

@@ -47,4 +47,7 @@ sourcemap = "9.0"
 tempfile = "3.14"
 semver = "1.0"
 
+# Hashtree for large payload chunking (Phase 2)
+hashtree-core = "0.2"
+
 [dev-dependencies]

@@ -1,6 +1,11 @@
 """
 Bugstr - Zero-infrastructure crash reporting via NIP-17 encrypted DMs.
 
+For large crash reports (>50KB), uses CHK chunking:
+- Chunks are published as public events (kind 10422)
+- Manifest with root hash is gift-wrapped (kind 10421)
+- Only the recipient can decrypt chunks using the root hash
+
 Basic usage:
 
     import bugstr
@@ -25,12 +30,55 @@ import json
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+
+# Transport layer constants
+KIND_DIRECT = 10420
+KIND_MANIFEST = 10421
+KIND_CHUNK = 10422
+DIRECT_SIZE_THRESHOLD = 50 * 1024  # 50KB
+MAX_CHUNK_SIZE = 48 * 1024  # 48KB
+
+# Relay rate limits (strfry + noteguard: 8 posts/min = 7.5s between posts)
+DEFAULT_RELAY_RATE_LIMIT = 7.5  # seconds
+RELAY_RATE_LIMITS = {
+    "wss://relay.damus.io": 7.5,
+    "wss://nos.lol": 7.5,
+    "wss://relay.primal.net": 7.5,
+}
+
+
+def get_relay_rate_limit(relay_url: str) -> float:
+    """Get rate limit for a relay URL in seconds."""
+    return RELAY_RATE_LIMITS.get(relay_url, DEFAULT_RELAY_RATE_LIMIT)
+
+
+def estimate_upload_seconds(total_chunks: int, num_relays: int) -> int:
+    """Estimate upload time for given chunks and relays."""
+    sec_per_chunk = DEFAULT_RELAY_RATE_LIMIT / num_relays
+    return max(1, int(total_chunks * sec_per_chunk))
+
+
+@dataclass
+class Progress:
+    """Progress state for crash report upload (HIG-compliant)."""
+    phase: str  # 'preparing', 'uploading', 'finalizing'
+    current_chunk: int
+    total_chunks: int
+    fraction_completed: float
+    estimated_seconds_remaining: int
+    localized_description: str
 
 # Nostr imports - using nostr-sdk
 try:
@@ -87,6 +135,9 @@ class Config:
     confirm_send: Optional[Callable[[str, str], bool]] = None
     """Hook to confirm before sending. Args: (message, stack_preview). Return True to send."""
 
+    on_progress: Optional[Callable[["Progress"], None]] = None
+    """Progress callback for large crash reports. Fires in background thread."""
+
 
 @dataclass
 class Payload:
@@ -116,6 +167,8 @@ _developer_pubkey_hex: str = ""
 _initialized = False
 _lock = threading.Lock()
 _original_excepthook = None
+_last_post_time: dict[str, float] = {}
+_last_post_time_lock = threading.Lock()
 
 
 def init(
@@ -292,6 +345,89 @@ def _maybe_compress(plaintext: str) -> str:
     return json.dumps(envelope)
 
 
+# HKDF salt for CHK derivation (must match hashtree-core)
+CHK_SALT = b"hashtree-chk"
+
+# HKDF info for key derivation (must match hashtree-core)
+CHK_INFO = b"encryption-key"
+
+# Nonce size for AES-GCM (96 bits)
+NONCE_SIZE = 12
+
+
+def _derive_key(content_hash: bytes) -> bytes:
+    """Derive encryption key from content hash using HKDF-SHA256.
+
+    Must match hashtree-core: HKDF(content_hash, salt="hashtree-chk", info="encryption-key")
+    """
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=CHK_SALT,
+        info=CHK_INFO,
+        backend=default_backend(),
+    )
+    return hkdf.derive(content_hash)
+
+
+def _chk_encrypt(data: bytes, content_hash: bytes) -> bytes:
+    """Encrypt data using AES-256-GCM with zero nonce (CHK-safe).
+
+    Returns: [ciphertext][16-byte auth tag]
+
+    Zero nonce is safe for CHK because same key = same content (convergent encryption).
+
+    **CRITICAL**: Must match hashtree-core crypto exactly:
+    - Key derivation: HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
+    - Cipher: AES-256-GCM with 12-byte zero nonce
+    - Format: [ciphertext][16-byte auth tag]
+    """
+    key = _derive_key(content_hash)
+    zero_nonce = bytes(NONCE_SIZE)  # All zeros
+
+    aesgcm = AESGCM(key)
+    # AESGCM.encrypt returns ciphertext with auth tag appended
+    return aesgcm.encrypt(zero_nonce, data, None)
+
+
+def _chunk_payload(data: bytes) -> tuple[str, list[dict]]:
+    """Split data into chunks and encrypt each using CHK.
+
+    Returns:
+        Tuple of (root_hash, list of chunk dicts with index, hash, encrypted)
+    """
+    chunks = []
+    chunk_hashes = []
+
+    offset = 0
+    index = 0
+    while offset < len(data):
+        end = min(offset + MAX_CHUNK_SIZE, len(data))
+        chunk_data = data[offset:end]
+
+        # Compute hash of plaintext (becomes encryption key)
+        chunk_hash = hashlib.sha256(chunk_data).digest()
+        chunk_hashes.append(chunk_hash)
+
+        # Encrypt chunk using its hash as key
+        encrypted = _chk_encrypt(chunk_data, chunk_hash)
+
+        chunks.append({
+            "index": index,
+            "hash": chunk_hash.hex(),
+            "encrypted": encrypted,
+        })
+
+        offset = end
+        index += 1
+
+    # Compute root hash from all chunk hashes
+    root_hash_input = b"".join(chunk_hashes)
+    root_hash = hashlib.sha256(root_hash_input).hexdigest()
+
+    return root_hash, chunks
+
+
 def _maybe_send(payload: Payload) -> None:
     """Apply hooks and send payload."""
     if not _config:
@@ -315,70 +451,307 @@ def _maybe_send(payload: Payload) -> None:
     thread.start()
 
 
+def _build_gift_wrap(rumor_kind: int, content: str) -> Event:
+    """Build a NIP-17 gift-wrapped event for a rumor."""
+    # NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
+    rumor = {
+        "pubkey": _sender_keys.public_key().to_hex(),
+        "created_at": int(time.time()),
+        "kind": rumor_kind,
+        "tags": [["p", _developer_pubkey_hex]],
+        "content": content,
+        "sig": "",
+    }
+
+    serialized = json.dumps([
+        0,
+        rumor["pubkey"],
+        rumor["created_at"],
+        rumor["kind"],
+        rumor["tags"],
+        rumor["content"],
+    ], separators=(",", ":"))
+    rumor["id"] = hashlib.sha256(serialized.encode()).hexdigest()
+
+    rumor_json = json.dumps(rumor)
+
+    developer_pk = PublicKey.from_hex(_developer_pubkey_hex)
+    seal_content = nip44.encrypt(_sender_keys.secret_key(), developer_pk, rumor_json)
+
+    seal = EventBuilder(
+        Kind(13),
+        seal_content,
+    ).custom_created_at(_random_past_timestamp()).to_event(_sender_keys)
+
+    wrapper_keys = Keys.generate()
+    seal_json = seal.as_json()
+    gift_content = nip44.encrypt(wrapper_keys.secret_key(), developer_pk, seal_json)
+
+    return EventBuilder(
+        Kind(1059),
+        gift_content,
+    ).custom_created_at(_random_past_timestamp()).tags([
+        Tag.public_key(developer_pk)
+    ]).to_event(wrapper_keys)
+
+
+def _build_chunk_event(chunk: dict) -> Event:
+    """Build a public chunk event (kind 10422)."""
+    chunk_keys = Keys.generate()
+    chunk_payload = {
+        "v": 1,
+        "index": chunk["index"],
+        "hash": chunk["hash"],
+        "data": base64.b64encode(chunk["encrypted"]).decode(),
+    }
+    return EventBuilder(
+        Kind(KIND_CHUNK),
+        json.dumps(chunk_payload),
+    ).custom_created_at(_random_past_timestamp()).to_event(chunk_keys)
+
+
+def _publish_to_relays(event: Event) -> None:
+    """Publish an event to the first successful relay."""
+    client = Client(Keys.generate())
+    for relay_url in _config.relays:
+        try:
+            client.add_relay(relay_url)
+        except Exception:
+            pass
+
+    client.connect()
+    client.send_event(event)
+    client.disconnect()
+
+
+def _publish_to_all_relays(event: Event) -> None:
+    """Publish an event to all relays for redundancy."""
+    # Use threads to publish in parallel
+    threads = []
+    for relay_url in _config.relays:
+        def publish_to_relay(url):
+            try:
+                client = Client(Keys.generate())
+                client.add_relay(url)
+                client.connect()
+                client.send_event(event)
+                client.disconnect()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=publish_to_relay, args=(relay_url,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=10)
+
+
+def _wait_for_rate_limit(relay_url: str) -> None:
+    """Wait for relay rate limit if needed."""
+    rate_limit = get_relay_rate_limit(relay_url)
+
+    # Compute sleep duration inside lock to prevent race condition
+    with _last_post_time_lock:
+        last_time = _last_post_time.get(relay_url, 0)
+        elapsed = time.time() - last_time
+        sleep_duration = rate_limit - elapsed if elapsed < rate_limit else 0
+
+    if sleep_duration > 0:
+        time.sleep(sleep_duration)
+
+
+def _record_post_time(relay_url: str) -> None:
+    """Record post time for rate limiting."""
+    with _last_post_time_lock:
+        _last_post_time[relay_url] = time.time()
+
+
+def _publish_chunk_to_relay(event: Event, relay_url: str) -> bool:
+    """Publish a chunk to a single relay with rate limiting."""
+    _wait_for_rate_limit(relay_url)
+    try:
+        client = Client(Keys.generate())
+        client.add_relay(relay_url)
+        client.connect()
+        client.send_event(event)
+        client.disconnect()
+        _record_post_time(relay_url)
+        return True
+    except Exception:
+        return False
+
+
+def _verify_chunk_exists(event_id: str, relay_url: str) -> bool:
+    """Verify a chunk event exists on a relay."""
+    try:
+        from datetime import timedelta
+        from nostr_sdk import Filter, EventSource
+        client = Client(Keys.generate())
+        client.add_relay(relay_url)
+        client.connect()
+
+        # Query for the specific event by ID
+        filter = Filter().id(event_id).kind(Kind(KIND_CHUNK)).limit(1)
+        events = client.get_events_of([filter], EventSource.relays(timedelta(seconds=5)))
+        client.disconnect()
+
+        return len(events) > 0
+    except Exception:
+        return False
+
+
+def _publish_chunk_with_verify(event: Event, relays: list[str], start_index: int) -> tuple[bool, str]:
+    """Publish a chunk with verification and retry on failure.
+
+    Args:
+        event: The chunk event to publish
+        relays: List of relay URLs
+        start_index: Starting relay index (for round-robin)
+
+    Returns:
+        Tuple of (success, relay_url) where relay_url is where the chunk was published
+    """
+    num_relays = len(relays)
+    event_id = event.id().to_hex()
+
+    # Try each relay starting from start_index
+    for attempt in range(num_relays):
+        relay_url = relays[(start_index + attempt) % num_relays]
+
+        # Publish with rate limiting
+        if not _publish_chunk_to_relay(event, relay_url):
+            continue  # Try next relay
+
+        # Brief delay before verification to allow relay to process
+        time.sleep(0.5)
+
+        # Verify the chunk exists
+        if _verify_chunk_exists(event_id, relay_url):
+            return True, relay_url
+
+        # Verification failed, try next relay
+
+    return False, ""
+
+
 def _send_to_nostr(payload: Payload) -> None:
-    """Send payload via NIP-17 gift wrap."""
+    """Send payload via NIP-17 gift wrap, using chunking for large payloads.
+
+    Uses round-robin relay distribution to maximize throughput while
+    respecting per-relay rate limits (8 posts/min for strfry+noteguard).
+    """
     if not _sender_keys or not _config:
         return
 
     try:
         plaintext = json.dumps(payload.to_dict())
-        content = _maybe_compress(plaintext)
+        plaintext_bytes = plaintext.encode()
+        payload_size = len(plaintext_bytes)
 
-        # Build rumor (kind 14, unsigned)
-        rumor = {
-            "pubkey": _sender_keys.public_key().to_hex(),
-            "created_at": _random_past_timestamp(),
-            "kind": 14,
-            "tags": [["p", _developer_pubkey_hex]],
-            "content": content,
-            "sig": "",
-        }
+        if payload_size <= DIRECT_SIZE_THRESHOLD:
+            # Small payload: direct gift-wrapped delivery (no compression needed)
+            direct_payload = {"v": 1, "crash": payload.to_dict()}
+            gift_wrap = _build_gift_wrap(KIND_DIRECT, json.dumps(direct_payload))
+            _publish_to_relays(gift_wrap)
+        else:
+            # Large payload: compress and chunk for delivery
+            compressed = _maybe_compress(plaintext)
+            payload_bytes = compressed.encode()
 
-        # Compute rumor ID
-        serialized = json.dumps([
-            0,
-            rumor["pubkey"],
-            rumor["created_at"],
-            rumor["kind"],
-            rumor["tags"],
-            rumor["content"],
-        ], separators=(",", ":"))
-        rumor["id"] = hashlib.sha256(serialized.encode()).hexdigest()
+            # Chunked delivery with round-robin distribution
+            root_hash, chunks = _chunk_payload(payload_bytes)
+            total_chunks = len(chunks)
+            relays = _config.relays or DEFAULT_RELAYS
+            num_relays = len(relays)
 
-        rumor_json = json.dumps(rumor)
+            # Report initial progress
+            if _config.on_progress:
+                estimated_seconds = estimate_upload_seconds(total_chunks, num_relays)
+                _config.on_progress(Progress(
+                    phase="preparing",
+                    current_chunk=0,
+                    total_chunks=total_chunks,
+                    fraction_completed=0.0,
+                    estimated_seconds_remaining=estimated_seconds,
+                    localized_description="Preparing crash report...",
+                ))
 
-        # Encrypt into seal (kind 13)
-        developer_pk = PublicKey.from_hex(_developer_pubkey_hex)
-        seal_content = nip44.encrypt(_sender_keys.secret_key(), developer_pk, rumor_json)
+            # Build and publish chunk events with round-robin distribution and verification
+            chunk_ids = []
+            chunk_relays = {}
 
-        seal = EventBuilder(
-            Kind(13),
-            seal_content,
-        ).custom_created_at(_random_past_timestamp()).to_event(_sender_keys)
+            for i, chunk in enumerate(chunks):
+                chunk_event = _build_chunk_event(chunk)
+                chunk_id = chunk_event.id().to_hex()
 
-        # Wrap in gift wrap (kind 1059) with random key
-        wrapper_keys = Keys.generate()
-        seal_json = seal.as_json()
-        gift_content = nip44.encrypt(wrapper_keys.secret_key(), developer_pk, seal_json)
+                # Publish with verification and retry (starts at round-robin relay)
+                success, success_relay = _publish_chunk_with_verify(chunk_event, relays, i % num_relays)
+                if not success:
+                    # Abort upload - don't publish partial/broken manifest
+                    import logging
+                    logging.error(f"Bugstr: failed to publish chunk {i}/{total_chunks} (id: {chunk_id})")
+                    if _config.on_progress:
+                        _config.on_progress(Progress(
+                            phase="uploading",
+                            current_chunk=i,
+                            total_chunks=total_chunks,
+                            fraction_completed=i / total_chunks * 0.95,
+                            estimated_seconds_remaining=0,
+                            localized_description=f"Failed to upload chunk {i}",
+                        ))
+                    return  # Silent failure - don't crash the app
 
-        gift_wrap = EventBuilder(
-            Kind(1059),
-            gift_content,
-        ).custom_created_at(_random_past_timestamp()).tags([
-            Tag.public_key(developer_pk)
-        ]).to_event(wrapper_keys)
+                chunk_ids.append(chunk_id)
+                chunk_relays[chunk_id] = [success_relay]
 
-        # Publish to relays
-        client = Client(wrapper_keys)
-        for relay_url in _config.relays:
-            try:
-                client.add_relay(relay_url)
-            except Exception:
-                pass
+                # Report progress
+                if _config.on_progress:
+                    remaining_chunks = total_chunks - i - 1
+                    remaining_seconds = estimate_upload_seconds(remaining_chunks, num_relays)
+                    _config.on_progress(Progress(
+                        phase="uploading",
+                        current_chunk=i + 1,
+                        total_chunks=total_chunks,
+                        fraction_completed=(i + 1) / total_chunks * 0.95,
+                        estimated_seconds_remaining=remaining_seconds,
+                        localized_description=f"Uploading chunk {i + 1} of {total_chunks}",
+                    ))
 
-        client.connect()
-        client.send_event(gift_wrap)
-        client.disconnect()
+            # Report finalizing
+            if _config.on_progress:
+                _config.on_progress(Progress(
+                    phase="finalizing",
+                    current_chunk=total_chunks,
+                    total_chunks=total_chunks,
+                    fraction_completed=0.95,
+                    estimated_seconds_remaining=2,
+                    localized_description="Finalizing...",
+                ))
+
+            # Build and publish manifest with relay hints
+            # total_size is the compressed data size (what gets chunked and reassembled)
+            manifest = {
+                "v": 1,
+                "root_hash": root_hash,
+                "total_size": len(payload_bytes),
+                "chunk_count": total_chunks,
+                "chunk_ids": chunk_ids,
+                "chunk_relays": chunk_relays,
+            }
+            manifest_gift_wrap = _build_gift_wrap(KIND_MANIFEST, json.dumps(manifest))
+            _publish_to_relays(manifest_gift_wrap)
+
+            # Report complete
+            if _config.on_progress:
+                _config.on_progress(Progress(
+                    phase="finalizing",
+                    current_chunk=total_chunks,
+                    total_chunks=total_chunks,
+                    fraction_completed=1.0,
+                    estimated_seconds_remaining=0,
+                    localized_description="Complete",
+                ))
 
     except Exception:
         # Silent failure - don't crash the app

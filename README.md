@@ -34,27 +34,19 @@ Crash → Cache locally → App restart → Show consent dialog → User approve
 
 All SDKs use the same default relay list, chosen for reliability:
 
-| Relay | Max Event Size | Max WebSocket | Notes |
-|-------|----------------|---------------|-------|
-| `wss://relay.damus.io` | 64 KB | 128 KB | strfry defaults |
-| `wss://relay.primal.net` | 64 KB | 128 KB | strfry defaults |
-| `wss://nos.lol` | 128 KB | 128 KB | Fallback relay |
+| Relay | Notes |
+|-------|-------|
+| `wss://relay.damus.io` | strfry defaults |
+| `wss://relay.primal.net` | strfry defaults |
+| `wss://nos.lol` | Fallback relay |
 
-**Note:** Most relays use strfry defaults (64 KB event size, 128 KB websocket payload). The practical limit for crash reports is ~60 KB to allow for gift-wrap envelope overhead.
+**Note:** Most relays enforce a 64 KB event size limit (strfry default). Keep compressed payloads under **60 KB** to allow for gift-wrap envelope overhead.
 
 You can override these defaults via the `relays` configuration option in each SDK.
 
 ## Size Limits & Compression
 
-Crash reports are subject to relay message size limits (see [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) `max_message_length`).
-
-| Relay Limit | Compatibility |
-|-------------|---------------|
-| 64 KB | ~99% of relays |
-| 128 KB | ~90% of relays |
-| 512 KB+ | Major relays only |
-
-**Practical limit:** Keep compressed payloads under **60 KB** for universal delivery (allows ~500 bytes for gift-wrap envelope overhead).
+Crash reports are subject to relay message size limits (see [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) `max_message_length`). Most relays enforce a **64 KB** limit.
 
 | Payload Size | Behavior |
 |--------------|----------|
@@ -85,7 +77,7 @@ Gzip typically achieves **70-90% reduction** on stack traces due to their repeti
 | 50 KB | ~5-10 KB | ~80-90% |
 | 200 KB | ~20-40 KB | ~80-85% |
 
-With gzip compression (70-90% reduction), most crash reports fit well within the 64 KB strfry default limit. For maximum compatibility, keep compressed payloads under 60 KB.
+With gzip compression, most crash reports fit well within the 64 KB limit.
 
 ## Nostr Protocol
 
@@ -102,27 +94,64 @@ Per NIP-17, rumors (kind 14) must include:
 - `id` - SHA256 hash of `[0, pubkey, created_at, kind, tags, content]`
 - `sig: ""` - Empty string (not omitted)
 
-Some clients (e.g., 0xchat) reject messages missing these fields.
-
 ## Shared Test Vectors
 
 The [`test-vectors/`](test-vectors/) directory contains JSON test cases for NIP-17. All platform implementations should validate against these vectors.
 
 ## Symbolication
 
-Release builds typically use code obfuscation/minification, producing stack traces with mangled names and memory addresses instead of readable function names and line numbers.
+The Rust receiver includes built-in symbolication for 7 platforms:
 
-**Current status:** Symbolication tooling is not yet implemented. Crash reports contain raw stack traces as captured.
+| Platform | Mapping File | Notes |
+|----------|--------------|-------|
+| Android | `mapping.txt` | ProGuard/R8 with full line-range support |
+| Electron/JS | `*.js.map` | Source map v3 |
+| Flutter | `*.symbols` | Via `flutter symbolize` or direct parsing |
+| Rust | Backtrace | Debug builds include source locations |
+| Go | Goroutine stacks | Symbol tables usually embedded |
+| Python | Tracebacks | Source file mapping |
+| React Native | `*.bundle.map` | Hermes bytecode + JS source maps |
 
-**Planned approach:**
-- Store mapping files (ProGuard, dSYM, sourcemaps) locally or in your CI
-- Use platform-specific tools to symbolicate:
-  - **Android**: `retrace` with ProGuard mapping
-  - **iOS/macOS**: `atos` or `symbolicatecrash` with dSYM
-  - **JavaScript**: Source map support in browser devtools
-  - **Flutter**: `flutter symbolize` with app symbols
+### CLI Usage
 
-Contributions welcome for automated symbolication in the receiver CLI/WebUI.
+```bash
+# Symbolicate a stack trace
+bugstr symbolicate --platform android --input crash.txt --mappings ./mappings \
+  --app-id com.example.app --version 1.0.0
+
+# Output formats: pretty (default) or json
+bugstr symbolicate --platform android --input crash.txt --format json
+```
+
+### Web API
+
+```bash
+# Start server with symbolication enabled
+bugstr serve --mappings ./mappings
+
+# POST to symbolicate endpoint
+curl -X POST http://localhost:3000/api/symbolicate \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"android","stack_trace":"...","app_id":"com.example","version":"1.0.0"}'
+```
+
+### Mapping File Organization
+
+```
+mappings/
+  android/
+    com.example.app/
+      1.0.0/mapping.txt
+      1.1.0/mapping.txt
+  electron/
+    my-app/
+      1.0.0/main.js.map
+  flutter/
+    com.example.app/
+      1.0.0/app.android-arm64.symbols
+```
+
+The receiver automatically falls back to the newest available version if an exact version match isn't found.
 
 ## Contributing
 
