@@ -403,7 +403,7 @@
                 const res = await fetch('/api/stats');
                 const stats = await res.json();
                 document.getElementById('total-crashes').textContent = stats.total_crashes;
-                document.getElementById('total-groups').textContent = groups.length || '-';
+                // Note: total-groups is updated in render() after groups are loaded
             } catch (e) {
                 console.error('Failed to fetch stats:', e);
             }
@@ -517,7 +517,7 @@
                         </div>
                         <div class="detail-item">
                             <label>Sender</label>
-                            <span>${escapeHtml(crash.sender_pubkey.slice(0, 16))}...</span>
+                            <span>${crash.sender_pubkey ? escapeHtml(crash.sender_pubkey.slice(0, 16)) + '...' : 'Unknown'}</span>
                         </div>
                         ${crash.environment ? `
                         <div class="detail-item">

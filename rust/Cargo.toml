@@ -30,7 +30,7 @@ chrono = "0.4"
 colored = "3.0"
 
 # Nostr crypto
-nostr = { version = "0.39", features = ["nip44"] }
+nostr = { version = "0.43", features = ["nip44"] }
 
 # Storage
 rusqlite = { version = "0.33", features = ["bundled"] }

@@ -17,7 +17,7 @@ bugstr pubkey --privkey <your-hex-or-nsec>
 # Output: npub1... (add this to your app's bugstr config)
 ```
 
-### Listen for crash reports
+### Listen for crash reports (CLI)
 
 ```bash
 # Basic usage
@@ -32,6 +32,26 @@ bugstr listen --privkey $BUGSTR_PRIVKEY --format json
 # Raw output (just the crash content)
 bugstr listen --privkey $BUGSTR_PRIVKEY --format raw
 ```
+
+### Web Dashboard
+
+Start the web server with an embedded dashboard to view and manage crash reports:
+
+```bash
+# Start on default port 3000
+bugstr serve --privkey <your-hex-or-nsec>
+
+# Custom port and relays
+bugstr serve --privkey $BUGSTR_PRIVKEY --port 8080 --relays wss://relay.damus.io
+
+# Open http://localhost:3000 in your browser
+```
+
+The dashboard provides:
+- Real-time crash report collection
+- SQLite storage for persistence
+- Grouping by exception type
+- Auto-refresh every 30 seconds
 
 ### Environment variable
 
@@ -64,6 +84,7 @@ let json = event.to_json();
 ## Features
 
 - **CLI receiver** — `bugstr listen` subscribes to relays, decrypts NIP-17 DMs, prints crash reports
+- **Web dashboard** — `bugstr serve` provides a browser-based UI with SQLite storage
 - **Compression** — gzip with versioned envelope format
 - **NIP-17 decryption** — unwraps gift wrap → seal → rumor
 - **Pretty/JSON/Raw output** — flexible output formats

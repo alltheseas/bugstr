@@ -67,10 +67,17 @@ impl Default for BugstrConfig {
 ///
 /// When a panic occurs, the stack trace is captured and saved
 /// to the provided cache for later user-consented transmission.
+///
+/// Note: This is a stub implementation. The full panic hook
+/// will be implemented in a future release.
 pub fn install_panic_hook(_cache: CrashReportCache) {
-    // TODO: Implement panic hook
-    // std::panic::set_hook(Box::new(move |info| { ... }));
-    unimplemented!("Panic hook not yet implemented")
+    // TODO: Implement full panic hook with:
+    // - Stack trace capture via backtrace crate
+    // - Serialization to cache directory
+    // - User consent flow before transmission
+    //
+    // For now, this is a no-op to avoid panicking in user code.
+    // Users should call capture_panic() manually in their panic hooks.
 }
 
 /// Local file-based crash report cache.

@@ -12,7 +12,7 @@ use axum::{
 use rust_embed::Embed;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 use crate::storage::{CrashGroup, CrashReport, CrashStorage};
 
@@ -28,10 +28,10 @@ pub struct AppState {
 
 /// Creates the web server router.
 pub fn create_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // CORS: Only allow same-origin requests by default.
+    // The dashboard is served from the same origin, so cross-origin
+    // requests are not needed. This is more secure than allowing Any.
+    let cors = CorsLayer::new();
 
     Router::new()
         // API routes
