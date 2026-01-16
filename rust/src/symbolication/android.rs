@@ -1,7 +1,21 @@
 //! Android symbolication using ProGuard/R8 mapping files.
 //!
 //! Parses ProGuard mapping.txt files and uses them to deobfuscate
-//! Android stack traces.
+//! Android stack traces. Supports the full R8/ProGuard line range format
+//! including original line number mappings for inlined methods.
+//!
+//! # ProGuard Mapping Format
+//!
+//! ```text
+//! original.ClassName -> obfuscated.name:
+//!     returnType methodName(params) -> obfuscatedMethod
+//!     startLine:endLine:returnType methodName(params) -> obfuscatedMethod
+//!     startLine:endLine:returnType methodName(params):origStart:origEnd -> obfuscatedMethod
+//!     startLine:endLine:returnType methodName(params):origStart -> obfuscatedMethod
+//! ```
+//!
+//! The `:origStart:origEnd` suffix indicates the original source line range,
+//! which differs from the obfuscated line range when methods are inlined.
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,30 +27,41 @@ use super::{
     MappingStore, SymbolicatedFrame, SymbolicatedStack, SymbolicationContext, SymbolicationError,
 };
 
+/// A single line range mapping entry.
+///
+/// Each entry maps an obfuscated line range to an original method and line range.
+/// Multiple entries can exist for the same obfuscated method name when methods
+/// are inlined or overloaded.
+#[derive(Debug, Clone)]
+struct LineRangeEntry {
+    /// Obfuscated line range start
+    obf_start: u32,
+    /// Obfuscated line range end
+    obf_end: u32,
+    /// Original line range start
+    orig_start: u32,
+    /// Original line range end
+    orig_end: u32,
+    /// Original method name for this line range
+    method_name: String,
+}
+
 /// Parsed ProGuard mapping entry for a class.
 #[derive(Debug, Clone)]
 struct ClassMapping {
     /// Original class name
     original: String,
     /// Obfuscated class name
+    #[allow(dead_code)]
     obfuscated: String,
-    /// Method mappings (obfuscated -> original)
-    methods: HashMap<String, MethodMapping>,
+    /// Line range mappings indexed by obfuscated method name.
+    /// Each method can have multiple line ranges (for inlined/overloaded methods).
+    method_line_ranges: HashMap<String, Vec<LineRangeEntry>>,
+    /// Methods without line info (obfuscated -> original name)
+    methods_no_lines: HashMap<String, String>,
     /// Field mappings (obfuscated -> original)
+    #[allow(dead_code)]
     fields: HashMap<String, String>,
-}
-
-/// Parsed ProGuard mapping entry for a method.
-#[derive(Debug, Clone)]
-struct MethodMapping {
-    /// Original method name
-    original: String,
-    /// Original return type
-    return_type: String,
-    /// Original parameter types
-    parameters: Vec<String>,
-    /// Line number mapping (obfuscated -> original)
-    line_mapping: Vec<(u32, u32, u32, u32)>, // (start_obf, end_obf, start_orig, end_orig)
 }
 
 /// Parsed ProGuard mapping file.
@@ -48,18 +73,31 @@ struct ProguardMapping {
 
 impl ProguardMapping {
     /// Parse a ProGuard mapping file.
+    ///
+    /// Handles the full R8/ProGuard format including:
+    /// - `startLine:endLine:returnType method(params) -> obfuscated`
+    /// - `startLine:endLine:returnType method(params):origStart -> obfuscated`
+    /// - `startLine:endLine:returnType method(params):origStart:origEnd -> obfuscated`
     fn parse<R: BufRead>(reader: R) -> Result<Self, SymbolicationError> {
         let mut classes = HashMap::new();
         let mut current_class: Option<ClassMapping> = None;
 
         // Regex patterns
         let class_re = Regex::new(r"^(\S+)\s+->\s+(\S+):$").unwrap();
+
+        // Method with line numbers and optional original line range
+        // Format: startLine:endLine:returnType methodName(params):origStart:origEnd -> obfuscated
+        //     or: startLine:endLine:returnType methodName(params):origStart -> obfuscated
+        //     or: startLine:endLine:returnType methodName(params) -> obfuscated
         let method_re = Regex::new(
-            r"^\s+(\d+):(\d+):(\S+)\s+(\S+)\((.*)\)\s+->\s+(\S+)$"
+            r"^\s+(\d+):(\d+):(\S+)\s+(\S+)\(([^)]*)\)(?::(\d+)(?::(\d+))?)?\s+->\s+(\S+)$"
         ).unwrap();
+
+        // Method without line numbers
         let method_no_line_re = Regex::new(
             r"^\s+(\S+)\s+([^\s(]+)\(([^)]*)\)\s+->\s+(\S+)$"
         ).unwrap();
+
         let field_re = Regex::new(r"^\s+(\S+)\s+(\S+)\s+->\s+(\S+)$").unwrap();
 
         for line in reader.lines() {
@@ -80,7 +118,8 @@ impl ProguardMapping {
                 current_class = Some(ClassMapping {
                     original: caps[1].to_string(),
                     obfuscated: caps[2].to_string(),
-                    methods: HashMap::new(),
+                    method_line_ranges: HashMap::new(),
+                    methods_no_lines: HashMap::new(),
                     fields: HashMap::new(),
                 });
                 continue;
@@ -90,53 +129,48 @@ impl ProguardMapping {
             if let Some(ref mut class) = current_class {
                 // Method with line numbers
                 if let Some(caps) = method_re.captures(&line) {
-                    let start_line: u32 = caps[1].parse().unwrap_or(0);
-                    let end_line: u32 = caps[2].parse().unwrap_or(0);
-                    let return_type = caps[3].to_string();
+                    let obf_start: u32 = caps[1].parse().unwrap_or(0);
+                    let obf_end: u32 = caps[2].parse().unwrap_or(0);
+                    let _return_type = &caps[3];
                     let method_name = caps[4].to_string();
-                    let params = caps[5].to_string();
-                    let obfuscated_name = caps[6].to_string();
+                    let _params = &caps[5];
+                    // Original line start (group 6) - if present
+                    let orig_start: u32 = caps.get(6)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(obf_start);
+                    // Original line end (group 7) - if present
+                    let orig_end: u32 = caps.get(7)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(orig_start + (obf_end - obf_start));
+                    let obfuscated_name = caps[8].to_string();
 
-                    let parameters: Vec<String> = if params.is_empty() {
-                        vec![]
-                    } else {
-                        params.split(',').map(|s| s.trim().to_string()).collect()
+                    let entry = LineRangeEntry {
+                        obf_start,
+                        obf_end,
+                        orig_start,
+                        orig_end,
+                        method_name,
                     };
 
-                    let mapping = class.methods.entry(obfuscated_name).or_insert_with(|| {
-                        MethodMapping {
-                            original: method_name.clone(),
-                            return_type: return_type.clone(),
-                            parameters: parameters.clone(),
-                            line_mapping: vec![],
-                        }
-                    });
-
-                    mapping.line_mapping.push((start_line, end_line, start_line, end_line));
+                    class.method_line_ranges
+                        .entry(obfuscated_name)
+                        .or_insert_with(Vec::new)
+                        .push(entry);
                     continue;
                 }
 
                 // Method without line numbers
                 if let Some(caps) = method_no_line_re.captures(&line) {
-                    let return_type = caps[1].to_string();
+                    let _return_type = &caps[1];
                     let method_name = caps[2].to_string();
-                    let params = caps[3].to_string();
+                    let _params = &caps[3];
                     let obfuscated_name = caps[4].to_string();
 
-                    let parameters: Vec<String> = if params.is_empty() {
-                        vec![]
-                    } else {
-                        params.split(',').map(|s| s.trim().to_string()).collect()
-                    };
-
-                    class.methods.entry(obfuscated_name).or_insert_with(|| {
-                        MethodMapping {
-                            original: method_name,
-                            return_type,
-                            parameters,
-                            line_mapping: vec![],
-                        }
-                    });
+                    // Only store if we don't already have line range info for this method
+                    if !class.method_line_ranges.contains_key(&obfuscated_name) {
+                        class.methods_no_lines.entry(obfuscated_name)
+                            .or_insert(method_name);
+                    }
                     continue;
                 }
 
@@ -160,41 +194,77 @@ impl ProguardMapping {
     }
 
     /// Deobfuscate a class name.
+    #[allow(dead_code)]
     fn deobfuscate_class(&self, obfuscated: &str) -> Option<&str> {
         self.classes.get(obfuscated).map(|c| c.original.as_str())
     }
 
-    /// Deobfuscate a method name.
+    /// Deobfuscate a method name (without line number context).
+    #[allow(dead_code)]
     fn deobfuscate_method(&self, class: &str, method: &str) -> Option<&str> {
-        self.classes
-            .get(class)
-            .and_then(|c| c.methods.get(method))
-            .map(|m| m.original.as_str())
+        let class_mapping = self.classes.get(class)?;
+
+        // First check methods without line info
+        if let Some(name) = class_mapping.methods_no_lines.get(method) {
+            return Some(name.as_str());
+        }
+
+        // Then check line range entries (return first match)
+        if let Some(entries) = class_mapping.method_line_ranges.get(method) {
+            if let Some(entry) = entries.first() {
+                return Some(entry.method_name.as_str());
+            }
+        }
+
+        None
     }
 
     /// Deobfuscate a full stack frame.
-    fn deobfuscate_frame(&self, class: &str, method: &str, line: Option<u32>) -> Option<(String, String, Option<u32>)> {
+    ///
+    /// Returns (original_class, original_method, original_line).
+    /// Preserves the original line number if no mapping is found.
+    fn deobfuscate_frame(
+        &self,
+        class: &str,
+        method: &str,
+        line: Option<u32>,
+    ) -> Option<(String, String, Option<u32>)> {
         let class_mapping = self.classes.get(class)?;
         let original_class = &class_mapping.original;
 
-        let method_mapping = class_mapping.methods.get(method);
-        let original_method = method_mapping
-            .map(|m| m.original.as_str())
-            .unwrap_or(method);
-
-        // Try to map line number
-        let original_line = line.and_then(|l| {
-            method_mapping.and_then(|m| {
-                for (start_obf, end_obf, start_orig, _end_orig) in &m.line_mapping {
-                    if l >= *start_obf && l <= *end_obf {
-                        return Some(start_orig + (l - start_obf));
+        // Try to find method and line mapping
+        if let Some(line_num) = line {
+            // Check line range entries for this obfuscated method
+            if let Some(entries) = class_mapping.method_line_ranges.get(method) {
+                for entry in entries {
+                    if line_num >= entry.obf_start && line_num <= entry.obf_end {
+                        // Found matching line range - calculate original line
+                        let offset = line_num - entry.obf_start;
+                        let orig_line = entry.orig_start + offset;
+                        return Some((
+                            original_class.clone(),
+                            entry.method_name.clone(),
+                            Some(orig_line),
+                        ));
                     }
                 }
-                Some(l) // Return original if no mapping found
-            })
-        });
+            }
+        }
 
-        Some((original_class.clone(), original_method.to_string(), original_line))
+        // No line range match - try to get method name without line info
+        let original_method = class_mapping.methods_no_lines.get(method)
+            .map(|s| s.as_str())
+            .or_else(|| {
+                // Fallback: use first line range entry's method name if available
+                class_mapping.method_line_ranges.get(method)
+                    .and_then(|entries| entries.first())
+                    .map(|e| e.method_name.as_str())
+            })
+            .unwrap_or(method);
+
+        // IMPORTANT: Preserve original line number when method mapping exists
+        // but line range doesn't match
+        Some((original_class.clone(), original_method.to_string(), line))
     }
 }
 
@@ -322,5 +392,123 @@ com.example.OtherClass -> a.b:
             mapping.deobfuscate_method("a.a", "a"),
             Some("myMethod")
         );
+    }
+
+    #[test]
+    fn test_parse_r8_format_with_original_line_ranges() {
+        // R8 format with :origStart:origEnd suffix
+        let mapping_content = r#"
+com.example.Inlined -> a.a:
+    1:5:void inlinedMethod():100:104 -> a
+    6:10:void anotherMethod():200:204 -> a
+"#;
+
+        let reader = Cursor::new(mapping_content);
+        let mapping = ProguardMapping::parse(reader).unwrap();
+
+        // Line 3 in obfuscated maps to line 102 in original (100 + offset 2)
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(3));
+        assert!(result.is_some());
+        let (class, method, line) = result.unwrap();
+        assert_eq!(class, "com.example.Inlined");
+        assert_eq!(method, "inlinedMethod");
+        assert_eq!(line, Some(102));
+
+        // Line 8 in obfuscated maps to line 202 in original (200 + offset 2)
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(8));
+        assert!(result.is_some());
+        let (class, method, line) = result.unwrap();
+        assert_eq!(class, "com.example.Inlined");
+        assert_eq!(method, "anotherMethod");
+        assert_eq!(line, Some(202));
+    }
+
+    #[test]
+    fn test_parse_r8_format_with_single_original_line() {
+        // R8 format with just :origStart (no origEnd)
+        let mapping_content = r#"
+com.example.MyClass -> a.a:
+    1:3:void singleLine():50 -> b
+"#;
+
+        let reader = Cursor::new(mapping_content);
+        let mapping = ProguardMapping::parse(reader).unwrap();
+
+        // Line 2 maps to 51 (50 + offset 1)
+        let result = mapping.deobfuscate_frame("a.a", "b", Some(2));
+        assert!(result.is_some());
+        let (_, method, line) = result.unwrap();
+        assert_eq!(method, "singleLine");
+        assert_eq!(line, Some(51));
+    }
+
+    #[test]
+    fn test_overloaded_methods_different_line_ranges() {
+        // Multiple methods with same obfuscated name but different line ranges
+        let mapping_content = r#"
+com.example.Overloads -> a.a:
+    1:5:void process(int):10:14 -> a
+    6:10:void process(java.lang.String):20:24 -> a
+    11:15:void helper():30:34 -> a
+"#;
+
+        let reader = Cursor::new(mapping_content);
+        let mapping = ProguardMapping::parse(reader).unwrap();
+
+        // Line 3 -> process(int) at line 12
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(3));
+        let (_, method, line) = result.unwrap();
+        assert_eq!(method, "process");
+        assert_eq!(line, Some(12));
+
+        // Line 8 -> process(String) at line 22
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(8));
+        let (_, method, line) = result.unwrap();
+        assert_eq!(method, "process");
+        assert_eq!(line, Some(22));
+
+        // Line 13 -> helper at line 32
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(13));
+        let (_, method, line) = result.unwrap();
+        assert_eq!(method, "helper");
+        assert_eq!(line, Some(32));
+    }
+
+    #[test]
+    fn test_preserve_line_number_when_method_mapping_missing() {
+        let mapping_content = r#"
+com.example.MyClass -> a.a:
+    void knownMethod() -> a
+"#;
+
+        let reader = Cursor::new(mapping_content);
+        let mapping = ProguardMapping::parse(reader).unwrap();
+
+        // Unknown method 'b' with line 42 - should preserve the line number
+        let result = mapping.deobfuscate_frame("a.a", "b", Some(42));
+        assert!(result.is_some());
+        let (class, method, line) = result.unwrap();
+        assert_eq!(class, "com.example.MyClass");
+        assert_eq!(method, "b"); // Unknown method name preserved
+        assert_eq!(line, Some(42)); // Line number preserved!
+    }
+
+    #[test]
+    fn test_preserve_line_number_when_line_range_not_matched() {
+        let mapping_content = r#"
+com.example.MyClass -> a.a:
+    1:10:void myMethod():100:109 -> a
+"#;
+
+        let reader = Cursor::new(mapping_content);
+        let mapping = ProguardMapping::parse(reader).unwrap();
+
+        // Line 50 is outside the mapped range 1-10, should preserve original line
+        let result = mapping.deobfuscate_frame("a.a", "a", Some(50));
+        assert!(result.is_some());
+        let (class, method, line) = result.unwrap();
+        assert_eq!(class, "com.example.MyClass");
+        assert_eq!(method, "myMethod"); // Method name still resolved
+        assert_eq!(line, Some(50)); // Line number preserved since no range matched
     }
 }
