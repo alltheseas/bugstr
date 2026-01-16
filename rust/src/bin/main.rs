@@ -66,6 +66,10 @@ enum Commands {
         /// Database file path
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
+
+        /// Directory containing mapping files for symbolication
+        #[arg(long)]
+        mappings: Option<PathBuf>,
     },
 
     /// Show your receiver pubkey (npub)
@@ -141,8 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relays,
             port,
             db,
+            mappings,
         } => {
-            serve(&privkey, &relays, port, db).await?;
+            serve(&privkey, &relays, port, db, mappings).await?;
         }
         Commands::Pubkey { privkey } => {
             show_pubkey(&privkey)?;
@@ -291,6 +296,7 @@ async fn serve(
     relays: &[String],
     port: u16,
     db_path: PathBuf,
+    mappings_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let secret = parse_privkey(privkey)?;
     let keys = Keys::new(secret);
@@ -298,7 +304,17 @@ async fn serve(
 
     // Open/create database
     let storage = CrashStorage::open(&db_path)?;
-    let state = Arc::new(AppState { storage: Mutex::new(storage) });
+
+    // Create symbolicator if mappings directory is provided
+    let symbolicator = mappings_dir.as_ref().map(|dir| {
+        let store = MappingStore::new(dir);
+        Symbolicator::new(store)
+    });
+
+    let state = Arc::new(AppState {
+        storage: Mutex::new(storage),
+        symbolicator,
+    });
 
     println!("{}", "━".repeat(60).dimmed());
     println!(
@@ -310,6 +326,9 @@ async fn serve(
     println!("  {} {}", "Database:".cyan(), db_path.display());
     println!("  {} http://localhost:{}", "Dashboard:".cyan(), port);
     println!("  {} {}", "Relays:".cyan(), relays.join(", "));
+    if let Some(ref dir) = mappings_dir {
+        println!("  {} {}", "Mappings:".cyan(), dir.display());
+    }
     println!("{}", "━".repeat(60).dimmed());
     println!();
 

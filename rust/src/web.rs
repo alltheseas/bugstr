@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rust_embed::Embed;
@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
 use crate::storage::{CrashGroup, CrashReport, CrashStorage};
+use crate::symbolication::{Platform, Symbolicator, SymbolicationContext};
 
 /// Embedded static files for the dashboard.
 #[derive(Embed)]
@@ -24,6 +25,7 @@ struct Assets;
 /// Shared application state.
 pub struct AppState {
     pub storage: Mutex<CrashStorage>,
+    pub symbolicator: Option<Symbolicator>,
 }
 
 /// Creates the web server router.
@@ -39,6 +41,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/crashes/{id}", get(get_crash))
         .route("/api/groups", get(get_groups))
         .route("/api/stats", get(get_stats))
+        .route("/api/symbolicate", post(symbolicate_stack))
         // Static files and SPA fallback
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
@@ -83,6 +86,50 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match storage.count() {
         Ok(total) => Json(StatsJson { total_crashes: total }).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// POST /api/symbolicate - Symbolicate a stack trace
+async fn symbolicate_stack(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SymbolicateRequest>,
+) -> impl IntoResponse {
+    let Some(ref symbolicator) = state.symbolicator else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Symbolication not configured. Start server with --mappings option."
+            }))
+        ).into_response();
+    };
+
+    let platform = Platform::from_str(&request.platform);
+    let context = SymbolicationContext {
+        platform,
+        app_id: request.app_id,
+        version: request.version,
+        build_id: request.build_id,
+    };
+
+    match symbolicator.symbolicate(&request.stack_trace, &context) {
+        Ok(result) => Json(SymbolicateResponse {
+            symbolicated_count: result.symbolicated_count,
+            total_count: result.total_count,
+            percentage: result.percentage(),
+            display: result.display(),
+            frames: result.frames.iter().map(|f| FrameJson {
+                raw: f.raw.clone(),
+                function: f.function.clone(),
+                file: f.file.clone(),
+                line: f.line,
+                column: f.column,
+                symbolicated: f.symbolicated,
+            }).collect(),
+        }).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() }))
+        ).into_response(),
     }
 }
 
@@ -177,4 +224,39 @@ impl From<CrashGroup> for GroupJson {
 #[derive(serde::Serialize)]
 struct StatsJson {
     total_crashes: i64,
+}
+
+// Symbolication request/response types
+
+#[derive(serde::Deserialize)]
+struct SymbolicateRequest {
+    /// Stack trace to symbolicate
+    stack_trace: String,
+    /// Platform: android, electron, flutter, rust, go, python, react-native
+    platform: String,
+    /// Optional application ID
+    app_id: Option<String>,
+    /// Optional version
+    version: Option<String>,
+    /// Optional build ID
+    build_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SymbolicateResponse {
+    symbolicated_count: usize,
+    total_count: usize,
+    percentage: f64,
+    display: String,
+    frames: Vec<FrameJson>,
+}
+
+#[derive(serde::Serialize)]
+struct FrameJson {
+    raw: String,
+    function: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+    symbolicated: bool,
 }
