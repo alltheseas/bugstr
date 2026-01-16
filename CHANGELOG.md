@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - AGENTS.md with contributor guidelines and NIP-17/59 compliance notes
 - CHANGELOG.md for tracking version history
+- `UnsignedNostrEvent.computeId()` method for NIP-01 compliant event ID computation
 
 ### Fixed
-- UnsignedNostrEvent.toJson() now includes `id` and `sig` fields for NIP-17 compliance
+- `UnsignedNostrEvent.toJson()` now includes `id` and `sig` fields for NIP-17 compliance
+- Some clients (e.g., 0xchat) rejected messages without these fields
 
 ## [0.1.0] - 2025-01-15
 
