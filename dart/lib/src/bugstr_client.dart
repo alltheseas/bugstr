@@ -30,6 +30,10 @@ class Bugstr {
   static bool _initialized = false;
   static FlutterExceptionHandler? _originalOnError;
   static ErrorCallback? _originalOnPlatformError;
+  static BugstrProgressCallback? _onProgress;
+
+  /// Track last post time per relay for rate limiting.
+  static final Map<String, int> _lastPostTime = {};
 
   Bugstr._();
 
@@ -38,12 +42,22 @@ class Bugstr {
   /// This installs global error handlers for Flutter and Dart errors.
   /// Call this early in your app's main() function.
   ///
+  /// Crash reports are sent asynchronously in the background - they never
+  /// block the main thread or prevent user interaction after confirmation.
+  ///
+  /// For large reports (>50KB), use [onProgress] to show upload progress.
+  /// The callback fires asynchronously and can be used to update UI state:
+  ///
   /// ```dart
   /// void main() {
   ///   Bugstr.init(
   ///     developerPubkey: 'npub1...',
   ///     environment: 'production',
   ///     release: '1.0.0',
+  ///     onProgress: (progress) {
+  ///       // Update UI state (non-blocking, async callback)
+  ///       uploadNotifier.value = progress;
+  ///     },
   ///   );
   ///   runApp(MyApp());
   /// }
@@ -57,6 +71,7 @@ class Bugstr {
     int maxStackCharacters = 200000,
     CrashPayload? Function(CrashPayload payload)? beforeSend,
     Future<bool> Function(String message, String? stackPreview)? confirmSend,
+    BugstrProgressCallback? onProgress,
   }) {
     if (_initialized) return;
 
@@ -72,6 +87,8 @@ class Bugstr {
           : null,
       confirmSend: confirmSend,
     );
+
+    _onProgress = onProgress;
 
     // Decode npub to hex
     _developerPubkeyHex = _decodePubkey(developerPubkey);
@@ -286,7 +303,44 @@ class Bugstr {
     await Future.wait(futures);
   }
 
+  /// Wait for relay rate limit if needed.
+  static Future<void> _waitForRateLimit(String relayUrl) async {
+    final rateLimit = getRelayRateLimit(relayUrl);
+    final lastTime = _lastPostTime[relayUrl] ?? 0;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final elapsed = now - lastTime;
+
+    if (elapsed < rateLimit) {
+      final waitMs = rateLimit - elapsed;
+      debugPrint('Bugstr: rate limit wait ${waitMs}ms for $relayUrl');
+      await Future.delayed(Duration(milliseconds: waitMs));
+    }
+  }
+
+  /// Record post time for rate limiting.
+  static void _recordPostTime(String relayUrl) {
+    _lastPostTime[relayUrl] = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  /// Publish chunk to a single relay with rate limiting.
+  static Future<void> _publishChunkToRelay(
+      String relayUrl, Nip01Event event) async {
+    await _waitForRateLimit(relayUrl);
+    await _publishToRelay(relayUrl, event);
+    _recordPostTime(relayUrl);
+  }
+
+  /// Estimate total upload time based on chunks and relays.
+  static int _estimateUploadSeconds(int totalChunks, int numRelays) {
+    // With round-robin, effective rate is numRelays * (1 post / 7.5s)
+    // Time per chunk = 7.5s / numRelays
+    final msPerChunk = defaultRelayRateLimit ~/ numRelays;
+    return (totalChunks * msPerChunk / 1000).ceil();
+  }
+
   /// Send payload via NIP-17 gift wrap, using chunking for large payloads.
+  /// Uses round-robin relay distribution to maximize throughput while
+  /// respecting per-relay rate limits (8 posts/min for strfry+noteguard).
   static Future<void> _sendToNostr(CrashPayload payload) async {
     if (_senderKeys == null || _developerPubkeyHex == null || _config == null) {
       return;
@@ -299,43 +353,82 @@ class Bugstr {
       final transportKind = getTransportKind(payloadBytes.length);
 
       if (transportKind == TransportKind.direct) {
-        // Small payload: direct gift-wrapped delivery
+        // Small payload: direct gift-wrapped delivery (no progress needed)
         final directPayload = DirectPayload(crash: payload.toJson());
-        final giftWrap = _buildGiftWrap(kindDirect, jsonEncode(directPayload.toJson()));
+        final giftWrap =
+            _buildGiftWrap(kindDirect, jsonEncode(directPayload.toJson()));
         await _publishToRelays(giftWrap);
         debugPrint('Bugstr: sent direct crash report');
       } else {
-        // Large payload: chunked delivery
-        debugPrint('Bugstr: payload ${payloadBytes.length} bytes, using chunked transport');
+        // Large payload: chunked delivery with round-robin distribution
+        debugPrint(
+            'Bugstr: payload ${payloadBytes.length} bytes, using chunked transport');
 
         final result = chunkPayload(payloadBytes);
-        debugPrint('Bugstr: split into ${result.chunks.length} chunks');
+        final totalChunks = result.chunks.length;
+        final relays = _config!.effectiveRelays;
+        debugPrint('Bugstr: split into $totalChunks chunks across ${relays.length} relays');
 
-        // Build and publish chunk events with delay to avoid rate limiting
-        const chunkPublishDelay = Duration(milliseconds: 100);
+        // Report initial progress
+        final estimatedSeconds = _estimateUploadSeconds(totalChunks, relays.length);
+        _onProgress?.call(BugstrProgress.preparing(totalChunks, estimatedSeconds));
+
+        // Build chunk events and track relay assignments
         final chunkIds = <String>[];
-        for (var i = 0; i < result.chunks.length; i++) {
+        final chunkRelays = <String, List<String>>{};
+
+        for (var i = 0; i < totalChunks; i++) {
           final chunk = result.chunks[i];
           final chunkEvent = _buildChunkEvent(chunk);
           chunkIds.add(chunkEvent.id);
-          await _publishToAllRelays(chunkEvent);
-          // Add delay between chunks (not after last chunk)
-          if (i < result.chunks.length - 1) {
-            await Future.delayed(chunkPublishDelay);
-          }
-        }
-        debugPrint('Bugstr: published ${result.chunks.length} chunks');
 
-        // Build and publish manifest
+          // Round-robin relay selection
+          final relayUrl = relays[i % relays.length];
+          chunkRelays[chunkEvent.id] = [relayUrl];
+
+          // Publish with rate limiting
+          try {
+            await _publishChunkToRelay(relayUrl, chunkEvent);
+          } catch (e) {
+            debugPrint('Bugstr: Failed to publish chunk $i to $relayUrl: $e');
+            // Try next relay as fallback
+            final fallbackRelay = relays[(i + 1) % relays.length];
+            try {
+              await _publishChunkToRelay(fallbackRelay, chunkEvent);
+              chunkRelays[chunkEvent.id] = [fallbackRelay];
+            } catch (e2) {
+              debugPrint('Bugstr: Fallback also failed: $e2');
+              // Continue anyway, cross-relay aggregation may still find it
+            }
+          }
+
+          // Report progress
+          final remainingChunks = totalChunks - i - 1;
+          final remainingSeconds =
+              _estimateUploadSeconds(remainingChunks, relays.length);
+          _onProgress
+              ?.call(BugstrProgress.uploading(i + 1, totalChunks, remainingSeconds));
+        }
+        debugPrint('Bugstr: published $totalChunks chunks');
+
+        // Report finalizing
+        _onProgress?.call(BugstrProgress.finalizing(totalChunks));
+
+        // Build and publish manifest with relay hints
         final manifest = ManifestPayload(
           rootHash: result.rootHash,
           totalSize: result.totalSize,
-          chunkCount: result.chunks.length,
+          chunkCount: totalChunks,
           chunkIds: chunkIds,
+          chunkRelays: chunkRelays,
         );
-        final manifestGiftWrap = _buildGiftWrap(kindManifest, jsonEncode(manifest.toJson()));
+        final manifestGiftWrap =
+            _buildGiftWrap(kindManifest, jsonEncode(manifest.toJson()));
         await _publishToRelays(manifestGiftWrap);
         debugPrint('Bugstr: sent chunked crash report manifest');
+
+        // Report complete
+        _onProgress?.call(BugstrProgress.completed(totalChunks));
       }
     } catch (e) {
       debugPrint('Bugstr: Failed to send crash report: $e');

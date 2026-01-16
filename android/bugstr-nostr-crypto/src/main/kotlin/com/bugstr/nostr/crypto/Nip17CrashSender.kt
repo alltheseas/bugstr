@@ -1,6 +1,7 @@
 package com.bugstr.nostr.crypto
 
 import android.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -11,19 +12,37 @@ import org.json.JSONObject
  * - Chunks are published as public events (kind 10422)
  * - Manifest with root hash is gift-wrapped (kind 10421)
  * - Only the recipient can decrypt chunks using the root hash
+ *
+ * Uses round-robin relay distribution to maximize throughput while respecting
+ * per-relay rate limits (8 posts/min for strfry+noteguard).
  */
 class Nip17CrashSender(
     private val payloadBuilder: Nip17PayloadBuilder,
     private val signer: NostrEventSigner,
     private val publisher: NostrEventPublisher,
 ) {
-    suspend fun send(request: Nip17SendRequest): Result<Unit> {
+    /** Track last post time per relay for rate limiting. */
+    private val lastPostTime = mutableMapOf<String, Long>()
+
+    /**
+     * Send a crash report via NIP-17 gift wrap.
+     *
+     * For large reports (>50KB), chunks are distributed across relays using
+     * round-robin to maximize throughput while respecting rate limits.
+     *
+     * @param request The send request containing payload and relay list.
+     * @param onProgress Optional callback for upload progress (fires asynchronously).
+     */
+    suspend fun send(
+        request: Nip17SendRequest,
+        onProgress: BugstrProgressCallback? = null,
+    ): Result<Unit> {
         val payloadSize = request.plaintext.toByteArray(Charsets.UTF_8).size
 
         return if (payloadSize <= Transport.DIRECT_SIZE_THRESHOLD) {
             sendDirect(request)
         } else {
-            sendChunked(request)
+            sendChunked(request, onProgress)
         }
     }
 
@@ -63,13 +82,43 @@ class Nip17CrashSender(
         return publisher.publishGiftWraps(signedWraps)
     }
 
-    private suspend fun sendChunked(request: Nip17SendRequest): Result<Unit> {
+    /** Wait for relay rate limit if needed. */
+    private suspend fun waitForRateLimit(relayUrl: String) {
+        val rateLimit = Transport.getRelayRateLimit(relayUrl)
+        val lastTime = lastPostTime[relayUrl] ?: 0L
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastTime
+
+        if (elapsed < rateLimit) {
+            val waitMs = rateLimit - elapsed
+            kotlinx.coroutines.delay(waitMs)
+        }
+    }
+
+    /** Record post time for rate limiting. */
+    private fun recordPostTime(relayUrl: String) {
+        lastPostTime[relayUrl] = System.currentTimeMillis()
+    }
+
+    private suspend fun sendChunked(
+        request: Nip17SendRequest,
+        onProgress: BugstrProgressCallback?,
+    ): Result<Unit> {
         val payloadBytes = request.plaintext.toByteArray(Charsets.UTF_8)
         val chunkingResult = Chunking.chunkPayload(payloadBytes)
+        val totalChunks = chunkingResult.chunks.size
+        val relays = request.relays.ifEmpty {
+            listOf("wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net")
+        }
 
-        // Build and publish chunk events with delay to avoid rate limiting
-        val chunkPublishDelayMs = 100L
+        // Report initial progress
+        val estimatedSeconds = Transport.estimateUploadSeconds(totalChunks, relays.size)
+        onProgress?.invoke(BugstrProgress.preparing(totalChunks, estimatedSeconds))
+
+        // Build and publish chunk events with round-robin distribution
         val chunkIds = mutableListOf<String>()
+        val chunkRelays = mutableMapOf<String, List<String>>()
+
         for ((index, chunk) in chunkingResult.chunks.withIndex()) {
             val chunkPayload = ChunkPayload(
                 index = chunk.index,
@@ -85,29 +134,56 @@ class Nip17CrashSender(
 
             chunkIds.add(signedChunk.id)
 
-            // Publish chunk to all relays
-            publisher.publishChunk(signedChunk).getOrElse { return Result.failure(it) }
+            // Round-robin relay selection
+            val relayUrl = relays[index % relays.size]
+            chunkRelays[signedChunk.id] = listOf(relayUrl)
 
-            // Add delay between chunks (not after last chunk)
-            if (index < chunkingResult.chunks.size - 1) {
-                kotlinx.coroutines.delay(chunkPublishDelayMs)
+            // Publish chunk to selected relay with rate limiting
+            waitForRateLimit(relayUrl)
+            val publishResult = publisher.publishChunkToRelay(signedChunk, relayUrl)
+            if (publishResult.isFailure) {
+                // Try fallback relay
+                val fallbackRelay = relays[(index + 1) % relays.size]
+                waitForRateLimit(fallbackRelay)
+                publisher.publishChunkToRelay(signedChunk, fallbackRelay)
+                    .getOrElse { /* Continue anyway, cross-relay aggregation may find it */ }
+                chunkRelays[signedChunk.id] = listOf(fallbackRelay)
             }
+            recordPostTime(relayUrl)
+
+            // Report progress
+            val remainingChunks = totalChunks - index - 1
+            val remainingSeconds = Transport.estimateUploadSeconds(remainingChunks, relays.size)
+            onProgress?.invoke(BugstrProgress.uploading(index + 1, totalChunks, remainingSeconds))
         }
 
-        // Build manifest
+        // Report finalizing
+        onProgress?.invoke(BugstrProgress.finalizing(totalChunks))
+
+        // Build manifest with relay hints
         val manifest = ManifestPayload(
             rootHash = chunkingResult.rootHash,
             totalSize = chunkingResult.totalSize,
-            chunkCount = chunkingResult.chunks.size,
+            chunkCount = totalChunks,
             chunkIds = chunkIds,
+            chunkRelays = chunkRelays,
         )
+
+        val chunkRelaysJson = JSONObject().apply {
+            chunkRelays.forEach { (id, urls) ->
+                put(id, JSONArray(urls))
+            }
+        }
 
         val manifestJson = JSONObject().apply {
             put("v", manifest.v)
             put("root_hash", manifest.rootHash)
             put("total_size", manifest.totalSize)
             put("chunk_count", manifest.chunkCount)
-            put("chunk_ids", manifest.chunkIds)
+            put("chunk_ids", JSONArray(manifest.chunkIds))
+            if (chunkRelays.isNotEmpty()) {
+                put("chunk_relays", chunkRelaysJson)
+            }
         }
 
         // Build gift wrap for manifest using kind 10421
@@ -140,7 +216,14 @@ class Nip17CrashSender(
             )
         }
 
-        return publisher.publishGiftWraps(signedWraps)
+        val result = publisher.publishGiftWraps(signedWraps)
+
+        // Report completion
+        if (result.isSuccess) {
+            onProgress?.invoke(BugstrProgress.completed(totalChunks))
+        }
+
+        return result
     }
 
     private fun buildChunkEvent(chunk: ChunkPayload, privateKeyHex: String): UnsignedNostrEvent {
@@ -166,6 +249,7 @@ data class Nip17SendRequest(
     val senderPrivateKeyHex: String,
     val recipients: List<Nip17Recipient>,
     val plaintext: String,
+    val relays: List<String> = emptyList(),
     val expirationSeconds: Long? = null,
     val replyToEventId: String? = null,
     val replyRelayHint: String? = null,
@@ -206,13 +290,23 @@ fun interface NostrEventSigner {
     fun sign(event: UnsignedNostrEvent, privateKeyHex: String): Result<SignedNostrEvent>
 }
 
-fun interface NostrEventPublisher {
+interface NostrEventPublisher {
     suspend fun publishGiftWraps(wraps: List<SignedGiftWrap>): Result<Unit>
 
     /**
-     * Publish a chunk event to all relays for redundancy.
-     * Default implementation calls publishGiftWraps with a single item.
+     * Publish a chunk event to a specific relay.
+     * Used for round-robin distribution to maximize throughput while respecting rate limits.
+     *
+     * @param chunk The signed chunk event to publish.
+     * @param relayUrl The relay URL to publish to.
      */
+    suspend fun publishChunkToRelay(chunk: SignedNostrEvent, relayUrl: String): Result<Unit>
+
+    /**
+     * Publish a chunk event to all relays for redundancy.
+     * @deprecated Use publishChunkToRelay for round-robin distribution.
+     */
+    @Deprecated("Use publishChunkToRelay for round-robin distribution")
     suspend fun publishChunk(chunk: SignedNostrEvent): Result<Unit> {
         // Default: just publish as a standalone event
         return Result.success(Unit)
