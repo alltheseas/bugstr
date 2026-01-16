@@ -3,10 +3,11 @@
 //! Uses Flutter symbol files or the external `flutter symbolize` command
 //! to symbolicate Dart stack traces from release builds.
 
-use std::fs;
+use std::io::Write;
 use std::process::Command;
 
 use regex::Regex;
+use tempfile::NamedTempFile;
 
 use super::{
     MappingStore, SymbolicatedFrame, SymbolicatedStack, SymbolicationContext, SymbolicationError,
@@ -56,17 +57,16 @@ impl<'a> FlutterSymbolicator<'a> {
         stack_trace: &str,
         symbols_path: &std::path::Path,
     ) -> Result<SymbolicatedStack, SymbolicationError> {
-        // Write stack trace to temp file
-        let temp_dir = std::env::temp_dir();
-        let input_path = temp_dir.join("bugstr_flutter_input.txt");
-        fs::write(&input_path, stack_trace)?;
+        // Write stack trace to a secure temp file
+        let mut temp_file = NamedTempFile::new()?;
+        temp_file.write_all(stack_trace.as_bytes())?;
 
         // Run flutter symbolize
         let output = Command::new("flutter")
             .args([
                 "symbolize",
                 "-i",
-                input_path.to_str().unwrap(),
+                temp_file.path().to_str().unwrap(),
                 "-d",
                 symbols_path.to_str().unwrap(),
             ])

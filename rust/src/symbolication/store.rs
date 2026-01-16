@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use semver::Version;
+
 use super::{Platform, SymbolicationError};
 
 /// Key for looking up mapping files.
@@ -183,7 +185,7 @@ impl MappingStore {
 
     /// Get mapping info, trying version fallbacks.
     ///
-    /// Tries exact version first, then looks for closest match.
+    /// Tries exact version first, then looks for closest match using semantic versioning.
     pub fn get_with_fallback(
         &self,
         platform: &Platform,
@@ -195,17 +197,19 @@ impl MappingStore {
             return Some(info);
         }
 
-        // Try to find any version for this app
-        let prefix = MappingKey {
-            platform: platform.clone(),
-            app_id: app_id.to_string(),
-            version: String::new(),
-        };
-
+        // Try to find the newest version for this app using semantic versioning
         self.mappings
             .iter()
-            .filter(|(k, _)| k.platform == prefix.platform && k.app_id == prefix.app_id)
-            .max_by(|(a, _), (b, _)| a.version.cmp(&b.version))
+            .filter(|(k, _)| k.platform == *platform && k.app_id == app_id)
+            .max_by(|(a, _), (b, _)| {
+                // Parse as semver, fallback to lexicographic if parsing fails
+                match (Version::parse(&a.version), Version::parse(&b.version)) {
+                    (Ok(va), Ok(vb)) => va.cmp(&vb),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Greater, // Valid semver > invalid
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Err(_)) => a.version.cmp(&b.version), // Fallback to lexicographic
+                }
+            })
             .map(|(_, v)| v)
     }
 
