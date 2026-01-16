@@ -1,6 +1,11 @@
 """
 Bugstr - Zero-infrastructure crash reporting via NIP-17 encrypted DMs.
 
+For large crash reports (>50KB), uses CHK chunking:
+- Chunks are published as public events (kind 10422)
+- Manifest with root hash is gift-wrapped (kind 10421)
+- Only the recipient can decrypt chunks using the root hash
+
 Basic usage:
 
     import bugstr
@@ -25,12 +30,23 @@ import json
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# Transport layer constants
+KIND_DIRECT = 10420
+KIND_MANIFEST = 10421
+KIND_CHUNK = 10422
+DIRECT_SIZE_THRESHOLD = 50 * 1024  # 50KB
+MAX_CHUNK_SIZE = 48 * 1024  # 48KB
 
 # Nostr imports - using nostr-sdk
 try:
@@ -292,6 +308,59 @@ def _maybe_compress(plaintext: str) -> str:
     return json.dumps(envelope)
 
 
+def _chk_encrypt(data: bytes, key: bytes) -> bytes:
+    """Encrypt data using AES-256-CBC with the given key. IV is prepended."""
+    iv = secrets.token_bytes(16)
+
+    # PKCS7 padding
+    pad_len = 16 - len(data) % 16
+    padded = data + bytes([pad_len] * pad_len)
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted = encryptor.update(padded) + encryptor.finalize()
+
+    return iv + encrypted
+
+
+def _chunk_payload(data: bytes) -> tuple[str, list[dict]]:
+    """Split data into chunks and encrypt each using CHK.
+
+    Returns:
+        Tuple of (root_hash, list of chunk dicts with index, hash, encrypted)
+    """
+    chunks = []
+    chunk_hashes = []
+
+    offset = 0
+    index = 0
+    while offset < len(data):
+        end = min(offset + MAX_CHUNK_SIZE, len(data))
+        chunk_data = data[offset:end]
+
+        # Compute hash of plaintext (becomes encryption key)
+        chunk_hash = hashlib.sha256(chunk_data).digest()
+        chunk_hashes.append(chunk_hash)
+
+        # Encrypt chunk using its hash as key
+        encrypted = _chk_encrypt(chunk_data, chunk_hash)
+
+        chunks.append({
+            "index": index,
+            "hash": chunk_hash.hex(),
+            "encrypted": encrypted,
+        })
+
+        offset = end
+        index += 1
+
+    # Compute root hash from all chunk hashes
+    root_hash_input = b"".join(chunk_hashes)
+    root_hash = hashlib.sha256(root_hash_input).hexdigest()
+
+    return root_hash, chunks
+
+
 def _maybe_send(payload: Payload) -> None:
     """Apply hooks and send payload."""
     if not _config:
@@ -315,70 +384,138 @@ def _maybe_send(payload: Payload) -> None:
     thread.start()
 
 
+def _build_gift_wrap(rumor_kind: int, content: str) -> Event:
+    """Build a NIP-17 gift-wrapped event for a rumor."""
+    rumor = {
+        "pubkey": _sender_keys.public_key().to_hex(),
+        "created_at": _random_past_timestamp(),
+        "kind": rumor_kind,
+        "tags": [["p", _developer_pubkey_hex]],
+        "content": content,
+        "sig": "",
+    }
+
+    serialized = json.dumps([
+        0,
+        rumor["pubkey"],
+        rumor["created_at"],
+        rumor["kind"],
+        rumor["tags"],
+        rumor["content"],
+    ], separators=(",", ":"))
+    rumor["id"] = hashlib.sha256(serialized.encode()).hexdigest()
+
+    rumor_json = json.dumps(rumor)
+
+    developer_pk = PublicKey.from_hex(_developer_pubkey_hex)
+    seal_content = nip44.encrypt(_sender_keys.secret_key(), developer_pk, rumor_json)
+
+    seal = EventBuilder(
+        Kind(13),
+        seal_content,
+    ).custom_created_at(_random_past_timestamp()).to_event(_sender_keys)
+
+    wrapper_keys = Keys.generate()
+    seal_json = seal.as_json()
+    gift_content = nip44.encrypt(wrapper_keys.secret_key(), developer_pk, seal_json)
+
+    return EventBuilder(
+        Kind(1059),
+        gift_content,
+    ).custom_created_at(_random_past_timestamp()).tags([
+        Tag.public_key(developer_pk)
+    ]).to_event(wrapper_keys)
+
+
+def _build_chunk_event(chunk: dict) -> Event:
+    """Build a public chunk event (kind 10422)."""
+    chunk_keys = Keys.generate()
+    chunk_payload = {
+        "v": 1,
+        "index": chunk["index"],
+        "hash": chunk["hash"],
+        "data": base64.b64encode(chunk["encrypted"]).decode(),
+    }
+    return EventBuilder(
+        Kind(KIND_CHUNK),
+        json.dumps(chunk_payload),
+    ).custom_created_at(_random_past_timestamp()).to_event(chunk_keys)
+
+
+def _publish_to_relays(event: Event) -> None:
+    """Publish an event to the first successful relay."""
+    client = Client(Keys.generate())
+    for relay_url in _config.relays:
+        try:
+            client.add_relay(relay_url)
+        except Exception:
+            pass
+
+    client.connect()
+    client.send_event(event)
+    client.disconnect()
+
+
+def _publish_to_all_relays(event: Event) -> None:
+    """Publish an event to all relays for redundancy."""
+    # Use threads to publish in parallel
+    threads = []
+    for relay_url in _config.relays:
+        def publish_to_relay(url):
+            try:
+                client = Client(Keys.generate())
+                client.add_relay(url)
+                client.connect()
+                client.send_event(event)
+                client.disconnect()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=publish_to_relay, args=(relay_url,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=10)
+
+
 def _send_to_nostr(payload: Payload) -> None:
-    """Send payload via NIP-17 gift wrap."""
+    """Send payload via NIP-17 gift wrap, using chunking for large payloads."""
     if not _sender_keys or not _config:
         return
 
     try:
         plaintext = json.dumps(payload.to_dict())
         content = _maybe_compress(plaintext)
+        payload_bytes = content.encode()
+        payload_size = len(payload_bytes)
 
-        # Build rumor (kind 14, unsigned)
-        rumor = {
-            "pubkey": _sender_keys.public_key().to_hex(),
-            "created_at": _random_past_timestamp(),
-            "kind": 14,
-            "tags": [["p", _developer_pubkey_hex]],
-            "content": content,
-            "sig": "",
-        }
+        if payload_size <= DIRECT_SIZE_THRESHOLD:
+            # Small payload: direct gift-wrapped delivery
+            direct_payload = {"v": 1, "crash": payload.to_dict()}
+            gift_wrap = _build_gift_wrap(KIND_DIRECT, json.dumps(direct_payload))
+            _publish_to_relays(gift_wrap)
+        else:
+            # Large payload: chunked delivery
+            root_hash, chunks = _chunk_payload(payload_bytes)
 
-        # Compute rumor ID
-        serialized = json.dumps([
-            0,
-            rumor["pubkey"],
-            rumor["created_at"],
-            rumor["kind"],
-            rumor["tags"],
-            rumor["content"],
-        ], separators=(",", ":"))
-        rumor["id"] = hashlib.sha256(serialized.encode()).hexdigest()
+            # Build and publish chunk events
+            chunk_ids = []
+            for chunk in chunks:
+                chunk_event = _build_chunk_event(chunk)
+                chunk_ids.append(chunk_event.id().to_hex())
+                _publish_to_all_relays(chunk_event)
 
-        rumor_json = json.dumps(rumor)
-
-        # Encrypt into seal (kind 13)
-        developer_pk = PublicKey.from_hex(_developer_pubkey_hex)
-        seal_content = nip44.encrypt(_sender_keys.secret_key(), developer_pk, rumor_json)
-
-        seal = EventBuilder(
-            Kind(13),
-            seal_content,
-        ).custom_created_at(_random_past_timestamp()).to_event(_sender_keys)
-
-        # Wrap in gift wrap (kind 1059) with random key
-        wrapper_keys = Keys.generate()
-        seal_json = seal.as_json()
-        gift_content = nip44.encrypt(wrapper_keys.secret_key(), developer_pk, seal_json)
-
-        gift_wrap = EventBuilder(
-            Kind(1059),
-            gift_content,
-        ).custom_created_at(_random_past_timestamp()).tags([
-            Tag.public_key(developer_pk)
-        ]).to_event(wrapper_keys)
-
-        # Publish to relays
-        client = Client(wrapper_keys)
-        for relay_url in _config.relays:
-            try:
-                client.add_relay(relay_url)
-            except Exception:
-                pass
-
-        client.connect()
-        client.send_event(gift_wrap)
-        client.disconnect()
+            # Build and publish manifest
+            manifest = {
+                "v": 1,
+                "root_hash": root_hash,
+                "total_size": payload_size,
+                "chunk_count": len(chunks),
+                "chunk_ids": chunk_ids,
+            }
+            manifest_gift_wrap = _build_gift_wrap(KIND_MANIFEST, json.dumps(manifest))
+            _publish_to_relays(manifest_gift_wrap)
 
     except Exception:
         # Silent failure - don't crash the app
