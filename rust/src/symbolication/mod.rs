@@ -8,7 +8,7 @@
 //! - **Android**: ProGuard/R8 mapping.txt files
 //! - **JavaScript/Electron**: Source map (.map) files
 //! - **Flutter/Dart**: Flutter symbol files or external `flutter symbolize`
-//! - **Rust**: DWARF debug info via addr2line
+//! - **Rust**: Backtrace parsing (debug builds include source locations)
 //! - **Go**: Go symbol tables (usually embedded)
 //! - **Python**: Source file mapping for bundled apps
 //! - **React Native**: Hermes bytecode maps + JS source maps
