@@ -1,5 +1,6 @@
 package com.bugstr.nostr.crypto
 
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
 import kotlin.math.absoluteValue
@@ -217,6 +218,19 @@ class Nip59GiftWrapper(
 
 /**
  * Minimal unsigned Nostr event representation.
+ *
+ * Per NIP-17, rumors (kind 14/15) must include:
+ * - `id`: SHA256 hash of the serialized event data
+ * - `sig`: Empty string (not omitted) to indicate unsigned status
+ *
+ * The event ID is computed as: sha256([0, pubkey, created_at, kind, tags, content])
+ *
+ * @property pubKey The public key of the event author (lowercase hex, 64 chars)
+ * @property createdAt Unix timestamp in seconds
+ * @property kind The event kind (14 for chat, 15 for file, 13 for seal, 1059 for gift wrap)
+ * @property tags List of tag arrays
+ * @property content The event content (plaintext for rumors, encrypted for seals/wraps)
+ * @property sig Signature field - empty string for rumors, actual signature for signed events
  */
 data class UnsignedNostrEvent(
     val pubKey: String,
@@ -224,31 +238,75 @@ data class UnsignedNostrEvent(
     val kind: Int,
     val tags: List<List<String>>,
     val content: String,
+    val sig: String = "",
 ) {
+    /**
+     * Computes the event ID per NIP-01.
+     *
+     * The ID is the SHA256 hash of the JSON-serialized array:
+     * [0, <pubkey>, <created_at>, <kind>, <tags>, <content>]
+     *
+     * @return Lowercase hex string (64 characters)
+     */
+    fun computeId(): String {
+        val serialized = buildString {
+            append("[0,\"")
+            append(pubKey.lowercase())
+            append("\",")
+            append(createdAt)
+            append(",")
+            append(kind)
+            append(",")
+            appendTagsJson(tags)
+            append(",\"")
+            append(content.escapeJson())
+            append("\"]")
+        }
+        return sha256Hex(serialized)
+    }
+
+    /**
+     * Serializes this event to JSON with all required fields including id and sig.
+     *
+     * Output format matches NIP-01 event structure:
+     * {"id":"...","pubkey":"...","created_at":...,"kind":...,"tags":[...],"content":"...","sig":"..."}
+     *
+     * @return JSON string representation of the event
+     */
     fun toJson(): String =
         buildString {
-            append("{\"pubkey\":\"")
-            append(pubKey)
+            append("{\"id\":\"")
+            append(computeId())
+            append("\",\"pubkey\":\"")
+            append(pubKey.lowercase())
             append("\",\"created_at\":")
             append(createdAt)
             append(",\"kind\":")
             append(kind)
-            append(",\"tags\":[")
-            tags.forEachIndexed { index, tag ->
-                if (index > 0) append(',')
-                append('[')
-                tag.forEachIndexed { tagIndex, value ->
-                    if (tagIndex > 0) append(',')
-                    append('"')
-                    append(value.escapeJson())
-                    append('"')
-                }
-                append(']')
-            }
-            append("],\"content\":\"")
+            append(",\"tags\":")
+            appendTagsJson(tags)
+            append(",\"content\":\"")
             append(content.escapeJson())
+            append("\",\"sig\":\"")
+            append(sig)
             append("\"}")
         }
+
+    private fun StringBuilder.appendTagsJson(tags: List<List<String>>) {
+        append('[')
+        tags.forEachIndexed { index, tag ->
+            if (index > 0) append(',')
+            append('[')
+            tag.forEachIndexed { tagIndex, value ->
+                if (tagIndex > 0) append(',')
+                append('"')
+                append(value.escapeJson())
+                append('"')
+            }
+            append(']')
+        }
+        append(']')
+    }
 }
 
 fun interface Nip44Encryptor {
@@ -283,6 +341,9 @@ open class RandomSource(
     }
 }
 
+/**
+ * Escapes special characters for JSON string values.
+ */
 private fun String.escapeJson(): String =
     this
         .replace("\\", "\\\\")
@@ -290,3 +351,14 @@ private fun String.escapeJson(): String =
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
+
+/**
+ * Computes SHA256 hash of a string and returns lowercase hex.
+ *
+ * @param input The string to hash (UTF-8 encoded)
+ * @return Lowercase hex string (64 characters)
+ */
+private fun sha256Hex(input: String): String {
+    val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+    return bytes.joinToString(separator = "") { byte -> "%02x".format(byte) }
+}

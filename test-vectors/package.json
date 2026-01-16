@@ -1,0 +1,16 @@
+{
+  "name": "bugstr-test-vectors",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NIP-17 compliance test vectors for Bugstr implementations",
+  "type": "module",
+  "scripts": {
+    "test": "node validate.js"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "@nostrability/schemata": "github:nostrability/schemata"
+  }
+}

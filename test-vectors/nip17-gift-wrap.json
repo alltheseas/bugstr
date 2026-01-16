@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NIP-17 Gift Wrap Test Vectors",
+  "description": "Test vectors for validating NIP-17/59 gift wrap implementations. Reference: https://github.com/nostrability/schemata",
+  "test_vectors": {
+    "event_id_computation": [
+      {
+        "name": "simple_rumor_no_tags",
+        "input": {
+          "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "created_at": 1234567890,
+          "kind": 14,
+          "tags": [],
+          "content": "test"
+        },
+        "serialized": "[0,\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",1234567890,14,[],\"test\"]",
+        "expected_id": "1bc0c6ea8e0a72276ebeaf1c722028dc8b0841c09b141174bd5976adfe67a65d"
+      },
+      {
+        "name": "rumor_with_p_tag",
+        "input": {
+          "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "created_at": 1234567890,
+          "kind": 14,
+          "tags": [["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]],
+          "content": "hello world"
+        },
+        "serialized": "[0,\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",1234567890,14,[[\"p\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]],\"hello world\"]",
+        "expected_id": "34286c63206447cb43d92f93054e8edfc275211fe830c0549daabf578bb8c3f8"
+      },
+      {
+        "name": "content_with_special_chars",
+        "input": {
+          "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "created_at": 1234567890,
+          "kind": 14,
+          "tags": [],
+          "content": "line1\nline2\ttab\"quote\\backslash"
+        },
+        "serialized": "[0,\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",1234567890,14,[],\"line1\\nline2\\ttab\\\"quote\\\\backslash\"]",
+        "expected_id": "e1e055550ce8cf02766370d7a513888134f7e14d72050b6d76ddb40d57aafcbc"
+      }
+    ],
+    "rumor_json_output": [
+      {
+        "name": "rumor_validates_against_kind14_schema",
+        "input": {
+          "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "created_at": 1234567890,
+          "kind": 14,
+          "tags": [["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]],
+          "content": "crash report"
+        },
+        "note": "Validates against @nostrability/schemata kind14Schema"
+      }
+    ]
+  },
+  "compliance_notes": {
+    "sig_field": {
+      "description": "Per nostrability schema, sig is not required for kind 14. However, some clients (0xchat) expect sig:'' in JSON output for compatibility.",
+      "recommendation": "Include sig:'' (empty string) in rumor JSON when sending to maximize client compatibility"
+    },
+    "id_field": {
+      "description": "id must be computed as sha256([0, pubkey, created_at, kind, tags, content])",
+      "format": "64 character lowercase hex string"
+    },
+    "pubkey_case": {
+      "description": "pubkey must be lowercase in serialization for correct ID computation"
+    }
+  },
+  "references": {
+    "nostrability_schema": "https://github.com/nostrability/schemata",
+    "nip17": "https://github.com/nostr-protocol/nips/blob/master/17.md",
+    "nip44": "https://github.com/nostr-protocol/nips/blob/master/44.md",
+    "nip59": "https://github.com/nostr-protocol/nips/blob/master/59.md",
+    "nip40": "https://github.com/nostr-protocol/nips/blob/master/40.md"
+  }
+}

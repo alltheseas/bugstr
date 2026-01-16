@@ -1,0 +1,22 @@
+name: bugstr
+description: Privacy-focused crash reporting for Flutter/Dart apps using NIP-17 gift-wrapped DMs.
+version: 0.1.0
+homepage: https://github.com/alltheseas/bugstr
+repository: https://github.com/alltheseas/bugstr/tree/main/dart
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # NIP-44 encryption - TBD: choose implementation
+  # nostr_tools: ^x.x.x
+  path_provider: ^2.1.0
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
