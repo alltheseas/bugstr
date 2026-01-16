@@ -14,6 +14,9 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 | TypeScript | Production | [`typescript/`](typescript/) |
 | Flutter/Dart | Skeleton | [`dart/`](dart/) |
 | Rust | CLI + Library | [`rust/`](rust/) |
+| Go | Library | [`go/`](go/) |
+| Python | Library | [`python/`](python/) |
+| React Native | Library | [`react-native/`](react-native/) |
 
 ## How It Works
 
@@ -26,6 +29,41 @@ Crash → Cache locally → App restart → Show consent dialog → User approve
 3. **User consent** - Dialog shows on next app launch
 4. **NIP-17 DM** - Encrypted, gift-wrapped message sent to developer
 5. **Auto-expiration** - Report deleted from relays after 30 days
+
+## Size Limits & Compression
+
+Crash reports are subject to relay message size limits (typically 64KB-512KB depending on relay).
+
+| Payload Size | Behavior |
+|--------------|----------|
+| < 1 KB | Sent as plain JSON |
+| ≥ 1 KB | Compressed with gzip, base64-encoded |
+
+### Compression Format
+
+Large payloads are wrapped in a versioned envelope:
+
+```json
+{
+  "v": 1,
+  "compression": "gzip",
+  "payload": "<base64-encoded-gzip-data>"
+}
+```
+
+Stack traces are automatically truncated to fit within limits (default: 200KB before compression). The receiver CLI/WebUI automatically detects and decompresses payloads.
+
+### Compression Efficiency
+
+Gzip typically achieves **70-90% reduction** on stack traces due to their repetitive text patterns:
+
+| Original Size | Compressed | Reduction |
+|---------------|------------|-----------|
+| 10 KB | ~1-2 KB | ~80-90% |
+| 50 KB | ~5-10 KB | ~80-90% |
+| 200 KB | ~20-40 KB | ~80-85% |
+
+This allows most crash reports to fit comfortably within relay limits even with large stack traces.
 
 ## NIP Compliance
 
