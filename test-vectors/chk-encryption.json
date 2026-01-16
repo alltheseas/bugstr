@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CHK Encryption Test Vectors",
+  "description": "Test vectors for Content Hash Key (CHK) encryption compatibility across SDKs. Generated from Rust hashtree-core reference implementation.",
+  "algorithm": {
+    "name": "CHK (Content Hash Key) Encryption",
+    "steps": [
+      "1. content_hash = SHA256(plaintext)",
+      "2. derived_key = HKDF-SHA256(ikm=content_hash, salt='hashtree-chk', info='encryption-key', length=32)",
+      "3. ciphertext = AES-256-GCM(key=derived_key, nonce=12_zero_bytes, plaintext)",
+      "4. output = ciphertext || auth_tag (16 bytes)"
+    ],
+    "constants": {
+      "hkdf_salt": "hashtree-chk",
+      "hkdf_info": "encryption-key",
+      "nonce": "000000000000000000000000",
+      "nonce_size_bytes": 12,
+      "auth_tag_size_bytes": 16
+    }
+  },
+  "test_vectors": [
+    {
+      "name": "simple_ascii_string",
+      "description": "Basic ASCII string encryption",
+      "plaintext": "Hello, CHK test vector!",
+      "plaintext_hex": "48656c6c6f2c2043484b207465737420766563746f7221",
+      "content_hash": "01037f41bf5f81f2fb3fd0194a831d1a50ec09e462a28e9139b0e81b2824d3da",
+      "ciphertext_base64": "yReOAXXWX2ePimAR8zQeYXD9OWLzFhoVM1U7pApbrX1yNUW1pUrF",
+      "ciphertext_hex": "c9178e0175d65f678f8a6011f3341e6170fd3962f3161a1533553ba40a5bad7d723545b5a54ac5"
+    }
+  ],
+  "verification_steps": [
+    "1. Compute SHA256 of plaintext_hex → should equal content_hash",
+    "2. Derive key using HKDF with content_hash as IKM",
+    "3. Encrypt plaintext with derived key and zero nonce",
+    "4. Compare output to ciphertext_hex (must be byte-identical)",
+    "5. Decrypt ciphertext_hex using content_hash → should equal plaintext"
+  ],
+  "references": {
+    "hashtree_core": "https://crates.io/crates/hashtree-core",
+    "hkdf_rfc": "https://datatracker.ietf.org/doc/html/rfc5869",
+    "aes_gcm": "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf"
+  }
+}

@@ -1,16 +1,18 @@
 /**
- * NIP-17 Schema Validation
+ * NIP-17 Schema Validation + CHK Encryption Verification
  *
- * Validates test vectors against NIP-17 kind-14 schema.
- * Schema based on nostrability/schemata specification.
+ * Validates:
+ * 1. NIP-17 test vectors against kind-14 schema (nostrability/schemata spec)
+ * 2. CHK encryption against Rust hashtree-core reference implementation
  *
  * Reference:
  * - https://github.com/nostrability/schemata/blob/master/nips/nip-17/kind-14/schema.yaml
  * - https://github.com/hzrd149/applesauce/pull/39
+ * - https://crates.io/crates/hashtree-core
  */
 
 import Ajv from "ajv";
-import { createHash } from "crypto";
+import { createHash, hkdfSync, createCipheriv, createDecipheriv } from "crypto";
 import { readFileSync } from "fs";
 
 const ajv = new Ajv({ strict: false, allErrors: true });
@@ -174,6 +176,97 @@ for (const testCase of vectors.test_vectors.rumor_json_output) {
   } else {
     console.log(`  ✗ ${name}`);
     console.log(`    Errors: ${JSON.stringify(validate.errors, null, 2)}`);
+    failed++;
+  }
+}
+
+// Test 3: CHK Encryption Compatibility
+console.log("\n3. CHK Encryption Tests (hashtree-core compatibility)\n");
+
+const chkVectors = JSON.parse(readFileSync("./chk-encryption.json", "utf-8"));
+
+/** CHK constants (must match hashtree-core) */
+const CHK_SALT = Buffer.from("hashtree-chk");
+const CHK_INFO = Buffer.from("encryption-key");
+const NONCE_SIZE = 12;
+const TAG_SIZE = 16;
+
+/**
+ * Derives encryption key from content hash using HKDF-SHA256.
+ */
+function deriveChkKey(contentHash) {
+  return Buffer.from(hkdfSync("sha256", contentHash, CHK_SALT, CHK_INFO, 32));
+}
+
+/**
+ * Encrypts data using AES-256-GCM with zero nonce.
+ */
+function chkEncrypt(data, contentHash) {
+  const key = deriveChkKey(contentHash);
+  const zeroNonce = Buffer.alloc(NONCE_SIZE);
+  const cipher = createCipheriv("aes-256-gcm", key, zeroNonce);
+  const ciphertext = Buffer.concat([cipher.update(data), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([ciphertext, authTag]);
+}
+
+/**
+ * Decrypts data using AES-256-GCM with zero nonce.
+ */
+function chkDecrypt(data, contentHash) {
+  const key = deriveChkKey(contentHash);
+  const zeroNonce = Buffer.alloc(NONCE_SIZE);
+  const ciphertext = data.subarray(0, data.length - TAG_SIZE);
+  const authTag = data.subarray(data.length - TAG_SIZE);
+  const decipher = createDecipheriv("aes-256-gcm", key, zeroNonce);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+for (const testCase of chkVectors.test_vectors) {
+  const { name, plaintext_hex, content_hash, ciphertext_hex } = testCase;
+  const plaintext = Buffer.from(plaintext_hex, "hex");
+  const expectedHash = content_hash;
+  const expectedCiphertext = Buffer.from(ciphertext_hex, "hex");
+
+  // Test 3a: Verify content hash (SHA256 of plaintext)
+  const computedHash = createHash("sha256").update(plaintext).digest("hex");
+  const hashMatch = computedHash === expectedHash;
+
+  // Test 3b: Verify encryption produces identical ciphertext
+  const computedCiphertext = chkEncrypt(plaintext, Buffer.from(expectedHash, "hex"));
+  const ciphertextMatch = computedCiphertext.equals(expectedCiphertext);
+
+  // Test 3c: Verify decryption recovers plaintext
+  let decryptionMatch = false;
+  try {
+    const decrypted = chkDecrypt(expectedCiphertext, Buffer.from(expectedHash, "hex"));
+    decryptionMatch = decrypted.equals(plaintext);
+  } catch (e) {
+    decryptionMatch = false;
+  }
+
+  if (hashMatch && ciphertextMatch && decryptionMatch) {
+    console.log(`  ✓ ${name}`);
+    console.log(`    - SHA256 hash: correct`);
+    console.log(`    - Encryption: byte-identical to Rust`);
+    console.log(`    - Decryption: round-trip verified`);
+    passed++;
+  } else {
+    console.log(`  ✗ ${name}`);
+    if (!hashMatch) {
+      console.log(`    SHA256 mismatch:`);
+      console.log(`    Expected: ${expectedHash}`);
+      console.log(`    Got:      ${computedHash}`);
+    }
+    if (!ciphertextMatch) {
+      console.log(`    Ciphertext mismatch:`);
+      console.log(`    Expected: ${ciphertext_hex}`);
+      console.log(`    Got:      ${computedCiphertext.toString("hex")}`);
+    }
+    if (!decryptionMatch) {
+      console.log(`    Decryption failed or mismatch`);
+    }
     failed++;
   }
 }

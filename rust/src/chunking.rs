@@ -255,6 +255,45 @@ pub fn estimate_overhead(payload_size: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Generate test vector for cross-SDK CHK compatibility verification.
+    /// Run with: cargo test generate_chk_test_vector -- --nocapture
+    #[test]
+    fn generate_chk_test_vector() {
+        use base64::Engine;
+
+        // Use a simple, reproducible plaintext
+        let plaintext = b"Hello, CHK test vector!";
+
+        // Encrypt using hashtree-core (the reference implementation)
+        let (ciphertext, key) = encrypt_chk(plaintext).expect("encryption should succeed");
+
+        // The key IS the content hash in CHK
+        let content_hash = key;
+
+        // Print test vector in JSON format
+        println!("\n=== CHK Test Vector ===");
+        println!("{{");
+        println!("  \"plaintext\": \"{}\",", String::from_utf8_lossy(plaintext));
+        println!(
+            "  \"plaintext_hex\": \"{}\",",
+            hex::encode(plaintext)
+        );
+        println!("  \"content_hash\": \"{}\",", hex::encode(&content_hash));
+        println!(
+            "  \"ciphertext_base64\": \"{}\",",
+            base64::engine::general_purpose::STANDARD.encode(&ciphertext)
+        );
+        println!("  \"ciphertext_hex\": \"{}\",", hex::encode(&ciphertext));
+        println!("  \"ciphertext_length\": {}", ciphertext.len());
+        println!("}}");
+
+        // Verify round-trip
+        let decrypted = decrypt_chk(&ciphertext, &content_hash).expect("decryption should succeed");
+        assert_eq!(decrypted, plaintext);
+
+        println!("\n=== Round-trip verified ===\n");
+    }
+
     #[test]
     fn test_chunk_and_reassemble_small() {
         // Small payload that fits in one chunk
