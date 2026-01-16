@@ -3,7 +3,10 @@
 //! Subscribes to Nostr relays and decrypts NIP-17 gift-wrapped crash reports.
 //! Optionally serves a web dashboard for viewing and analyzing crashes.
 
-use bugstr::{decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router};
+use bugstr::{
+    decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
+    MappingStore, Platform, Symbolicator, SymbolicationContext,
+};
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -71,6 +74,33 @@ enum Commands {
         #[arg(short, long, env = "BUGSTR_PRIVKEY")]
         privkey: String,
     },
+
+    /// Symbolicate a stack trace using mapping files
+    Symbolicate {
+        /// Platform: android, electron, flutter, rust, go, python, react-native
+        #[arg(short = 'P', long)]
+        platform: String,
+
+        /// Input file containing stack trace (or - for stdin)
+        #[arg(short, long, default_value = "-")]
+        input: String,
+
+        /// Directory containing mapping files
+        #[arg(short, long, default_value = "mappings")]
+        mappings: PathBuf,
+
+        /// Application ID (package name, bundle id, etc.)
+        #[arg(short, long)]
+        app_id: Option<String>,
+
+        /// Application version
+        #[arg(short, long)]
+        version: Option<String>,
+
+        /// Output format: pretty or json
+        #[arg(short, long, default_value = "pretty")]
+        format: SymbolicateFormat,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -78,6 +108,12 @@ enum OutputFormat {
     Pretty,
     Json,
     Raw,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum SymbolicateFormat {
+    Pretty,
+    Json,
 }
 
 /// A received crash report ready for storage.
@@ -111,6 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Pubkey { privkey } => {
             show_pubkey(&privkey)?;
         }
+        Commands::Symbolicate {
+            platform,
+            input,
+            mappings,
+            app_id,
+            version,
+            format,
+        } => {
+            symbolicate_stack(&platform, &input, &mappings, app_id, version, format)?;
+        }
     }
 
     Ok(())
@@ -136,6 +182,105 @@ fn show_pubkey(privkey: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("  hex:  {}", pubkey.to_hex());
     println!();
     println!("Add this pubkey to your app's bugstr configuration.");
+
+    Ok(())
+}
+
+/// Symbolicate a stack trace using mapping files.
+fn symbolicate_stack(
+    platform_str: &str,
+    input: &str,
+    mappings_dir: &PathBuf,
+    app_id: Option<String>,
+    version: Option<String>,
+    format: SymbolicateFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read stack trace
+    let stack_trace = if input == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(input)?
+    };
+
+    // Parse platform
+    let platform = Platform::from_str(platform_str);
+    if matches!(platform, Platform::Unknown(_)) {
+        eprintln!(
+            "{} Unknown platform '{}'. Supported: android, electron, flutter, rust, go, python, react-native",
+            "warning".yellow(),
+            platform_str
+        );
+    }
+
+    // Create symbolicator
+    let store = MappingStore::new(mappings_dir);
+    let symbolicator = Symbolicator::new(store);
+
+    // Create context
+    let context = SymbolicationContext {
+        platform,
+        app_id,
+        version,
+        build_id: None,
+    };
+
+    // Symbolicate
+    let result = symbolicator.symbolicate(&stack_trace, &context)?;
+
+    // Output
+    match format {
+        SymbolicateFormat::Pretty => {
+            println!("{}", "━".repeat(60).dimmed());
+            println!(
+                "{} {} frames symbolicated ({:.1}%)",
+                "Symbolication Results".green().bold(),
+                result.symbolicated_count,
+                result.percentage()
+            );
+            println!("{}", "━".repeat(60).dimmed());
+            println!();
+
+            for (i, frame) in result.frames.iter().enumerate() {
+                if frame.symbolicated {
+                    let location = match (&frame.file, frame.line) {
+                        (Some(f), Some(l)) => format!(" ({}:{})", f.dimmed(), l),
+                        (Some(f), None) => format!(" ({})", f.dimmed()),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "  {} {}{}",
+                        format!("#{}", i).cyan(),
+                        frame.function.as_deref().unwrap_or("<unknown>").green(),
+                        location
+                    );
+                } else {
+                    println!("  {} {}", format!("#{}", i).cyan(), frame.raw.dimmed());
+                }
+            }
+            println!();
+        }
+        SymbolicateFormat::Json => {
+            let output = serde_json::json!({
+                "symbolicated_count": result.symbolicated_count,
+                "total_count": result.total_count,
+                "percentage": result.percentage(),
+                "frames": result.frames.iter().map(|f| {
+                    serde_json::json!({
+                        "raw": f.raw,
+                        "function": f.function,
+                        "file": f.file,
+                        "line": f.line,
+                        "column": f.column,
+                        "symbolicated": f.symbolicated,
+                    })
+                }).collect::<Vec<_>>()
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+    }
 
     Ok(())
 }
