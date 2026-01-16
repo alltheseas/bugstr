@@ -220,8 +220,16 @@ fn symbolicate_stack(
         );
     }
 
-    // Create symbolicator
-    let store = MappingStore::new(mappings_dir);
+    // Create symbolicator with scanned mapping store
+    let mut store = MappingStore::new(mappings_dir);
+    let count = store.scan()?;
+    if count == 0 {
+        eprintln!(
+            "{} No mapping files found in {}",
+            "warning".yellow(),
+            mappings_dir.display()
+        );
+    }
     let symbolicator = Symbolicator::new(store);
 
     // Create context
@@ -306,10 +314,29 @@ async fn serve(
     let storage = CrashStorage::open(&db_path)?;
 
     // Create symbolicator if mappings directory is provided
-    let symbolicator = mappings_dir.as_ref().map(|dir| {
-        let store = MappingStore::new(dir);
-        Symbolicator::new(store)
-    });
+    let symbolicator = if let Some(ref dir) = mappings_dir {
+        let mut store = MappingStore::new(dir);
+        match store.scan() {
+            Ok(count) => {
+                if count == 0 {
+                    eprintln!(
+                        "{} No mapping files found in {}",
+                        "warning".yellow(),
+                        dir.display()
+                    );
+                } else {
+                    println!("  {} {} mapping files loaded", "Loaded:".cyan(), count);
+                }
+                Some(Symbolicator::new(store))
+            }
+            Err(e) => {
+                eprintln!("{} Failed to scan mappings: {}", "error".red(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         storage: Mutex::new(storage),
