@@ -607,13 +607,14 @@ async fn subscribe_relay_with_storage(
 
 /// Fetch chunk events from relays by their event IDs.
 ///
-/// Connects to all relays in parallel and aggregates chunk results.
-/// This allows chunks to be distributed across multiple relays.
+/// Uses relay hints from the manifest when available to optimize fetching.
+/// For each chunk, tries the hinted relay first before falling back to all relays.
 ///
 /// # Arguments
 ///
-/// * `relay_urls` - List of relay WebSocket URLs to query
+/// * `relay_urls` - List of relay WebSocket URLs to query (fallback)
 /// * `chunk_ids` - Event IDs of chunks to fetch (hex-encoded)
+/// * `chunk_relays` - Optional map of chunk ID to relay hints from manifest
 ///
 /// # Returns
 ///
@@ -628,6 +629,7 @@ async fn subscribe_relay_with_storage(
 async fn fetch_chunks(
     relay_urls: &[String],
     chunk_ids: &[String],
+    chunk_relays: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<Vec<ChunkPayload>, Box<dyn std::error::Error + Send + Sync>> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -650,9 +652,68 @@ async fn fetch_chunks(
     let expected_count = chunk_ids.len();
     let chunks: Arc<TokioMutex<HashMap<u32, ChunkPayload>>> = Arc::new(TokioMutex::new(HashMap::new()));
 
-    println!("  {} Fetching {} chunks from {} relays in parallel", "↓".blue(), expected_count, relay_urls.len());
+    // Determine if we have relay hints
+    let has_hints = chunk_relays.map(|h| !h.is_empty()).unwrap_or(false);
 
-    // Spawn parallel fetch tasks for all relays
+    if has_hints {
+        println!("  {} Fetching {} chunks using relay hints", "↓".blue(), expected_count);
+
+        // Phase 1: Try hinted relays first (grouped by relay for efficiency)
+        let mut relay_to_chunks: HashMap<String, Vec<(usize, EventId)>> = HashMap::new();
+
+        for (i, chunk_id) in chunk_ids.iter().enumerate() {
+            if let Some(hints) = chunk_relays.and_then(|h| h.get(chunk_id)) {
+                if let Some(relay) = hints.first() {
+                    relay_to_chunks
+                        .entry(relay.clone())
+                        .or_default()
+                        .push((i, event_ids[i]));
+                }
+            }
+        }
+
+        // Spawn parallel fetch tasks for hinted relays
+        let mut handles = Vec::new();
+        for (relay_url, chunk_indices) in relay_to_chunks {
+            let relay = relay_url.clone();
+            let ids: Vec<EventId> = chunk_indices.iter().map(|(_, id)| *id).collect();
+            let chunks_clone = Arc::clone(&chunks);
+            let expected = expected_count;
+
+            let handle = tokio::spawn(async move {
+                fetch_chunks_from_relay(&relay, &ids, chunks_clone, expected).await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for hinted relay fetches
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        // Check if we got all chunks from hinted relays
+        let current_count = chunks.lock().await.len();
+        if current_count == expected_count {
+            println!("  {} All {} chunks retrieved from hinted relays", "✓".green(), expected_count);
+            let final_chunks = chunks.lock().await;
+            let mut ordered: Vec<ChunkPayload> = Vec::with_capacity(expected_count);
+            for i in 0..expected_count {
+                match final_chunks.get(&(i as u32)) {
+                    Some(chunk) => ordered.push(chunk.clone()),
+                    None => return Err(format!("Missing chunk at index {}", i).into()),
+                }
+            }
+            return Ok(ordered);
+        }
+
+        // Phase 2: Fall back to all relays for missing chunks
+        let missing = expected_count - current_count;
+        println!("  {} {} chunks missing, falling back to all relays", "↓".blue(), missing);
+    } else {
+        println!("  {} Fetching {} chunks from {} relays in parallel", "↓".blue(), expected_count, relay_urls.len());
+    }
+
+    // Spawn parallel fetch tasks for all relays (for missing chunks or no hints)
     let mut handles = Vec::new();
     for relay_url in relay_urls {
         let relay = relay_url.clone();
@@ -854,8 +915,12 @@ async fn handle_message_for_storage(
                     manifest.total_size
                 );
 
-                // Fetch chunks from relays
-                let chunks = match fetch_chunks(relay_urls, &manifest.chunk_ids).await {
+                // Fetch chunks from relays (using relay hints if available)
+                let chunks = match fetch_chunks(
+                    relay_urls,
+                    &manifest.chunk_ids,
+                    manifest.chunk_relays.as_ref(),
+                ).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("{} Failed to fetch chunks: {}", "✗".red(), e);

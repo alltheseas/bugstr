@@ -122,6 +122,13 @@ pub struct ManifestPayload {
     ///
     /// Ordered list of chunk event IDs for retrieval.
     pub chunk_ids: Vec<String>,
+
+    /// Optional relay hints for each chunk (for optimized fetching).
+    ///
+    /// Maps chunk event ID to list of relay URLs where that chunk was published.
+    /// If present, the receiver should try these relays first when fetching chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_relays: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl ManifestPayload {
@@ -251,6 +258,7 @@ mod tests {
             total_size: 100000,
             chunk_count: 3,
             chunk_ids: vec!["id1".into(), "id2".into(), "id3".into()],
+            chunk_relays: None,
         };
 
         let json = manifest.to_json().unwrap();
@@ -258,6 +266,31 @@ mod tests {
 
         assert_eq!(parsed.root_hash, "abc123");
         assert_eq!(parsed.chunk_count, 3);
+        assert!(parsed.chunk_relays.is_none());
+    }
+
+    #[test]
+    fn test_manifest_payload_with_relay_hints() {
+        use std::collections::HashMap;
+        let mut chunk_relays = HashMap::new();
+        chunk_relays.insert("id1".to_string(), vec!["wss://relay.damus.io".to_string()]);
+        chunk_relays.insert("id2".to_string(), vec!["wss://nos.lol".to_string()]);
+
+        let manifest = ManifestPayload {
+            v: 1,
+            root_hash: "abc123".to_string(),
+            total_size: 100000,
+            chunk_count: 2,
+            chunk_ids: vec!["id1".into(), "id2".into()],
+            chunk_relays: Some(chunk_relays),
+        };
+
+        let json = manifest.to_json().unwrap();
+        let parsed = ManifestPayload::from_json(&json).unwrap();
+
+        assert!(parsed.chunk_relays.is_some());
+        let relays = parsed.chunk_relays.unwrap();
+        assert_eq!(relays.get("id1").unwrap(), &vec!["wss://relay.damus.io".to_string()]);
     }
 
     #[test]

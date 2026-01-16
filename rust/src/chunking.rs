@@ -128,13 +128,14 @@ pub fn chunk_payload(data: &[u8]) -> Result<ChunkingResult, ChunkingError> {
     }
     let root_hash = hex::encode(root_hasher.finalize());
 
-    // Build manifest (chunk_ids will be filled after publishing)
+    // Build manifest (chunk_ids and chunk_relays will be filled after publishing)
     let manifest = ManifestPayload {
         v: 1,
         root_hash,
         total_size,
         chunk_count: chunks.len() as u32,
         chunk_ids: vec![], // To be filled by caller after publishing chunks
+        chunk_relays: None, // Optional relay hints, filled by sender
     };
 
     Ok(ChunkingResult { manifest, chunks })
