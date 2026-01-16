@@ -11,7 +11,7 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 | Platform | Directory | Tested |
 |----------|-----------|--------|
 | Android/Kotlin | [`android/`](android/) | ✅ [Zapstore](https://github.com/zapstore/zapstore/pull/272) |
-| TypeScript | [`typescript/`](typescript/) | 🐹 Guinea pigs needed |
+| Electron | [`electron/`](electron/) | 🐹 Guinea pigs needed |
 | Flutter/Dart | [`dart/`](dart/) | 🐹 Guinea pigs needed |
 | Rust | [`rust/`](rust/) | 🐹 Guinea pigs needed |
 | Go | [`go/`](go/) | 🐹 Guinea pigs needed |
@@ -46,7 +46,7 @@ You can override these defaults via the `relays` configuration option in each SD
 
 ## Size Limits & Compression
 
-Crash reports are subject to relay message size limits (see [NIP-11](https://nips.nostr.com/11) `max_message_length`).
+Crash reports are subject to relay message size limits (see [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) `max_message_length`).
 
 | Relay Limit | Compatibility |
 |-------------|---------------|
@@ -87,16 +87,16 @@ Gzip typically achieves **70-90% reduction** on stack traces due to their repeti
 
 With gzip compression (70-90% reduction), most crash reports fit well within the 64 KB strfry default limit. For maximum compatibility, keep compressed payloads under 60 KB.
 
-## NIP Compliance
+## Nostr Protocol
 
-All implementations follow the same Nostr standards:
+All implementations use these NIPs:
 
-- **NIP-17** - Private Direct Messages (kind 14 rumors)
-- **NIP-44** - Versioned Encryption (v2, XChaCha20-Poly1305)
-- **NIP-59** - Gift Wrap (rumor → seal → gift wrap)
-- **NIP-40** - Expiration Timestamp
+- [**NIP-17**](https://github.com/nostr-protocol/nips/blob/master/17.md) - Private Direct Messages (kind 14 rumors)
+- [**NIP-44**](https://github.com/nostr-protocol/nips/blob/master/44.md) - Versioned Encryption (v2, XChaCha20-Poly1305)
+- [**NIP-59**](https://github.com/nostr-protocol/nips/blob/master/59.md) - Gift Wrap (rumor → seal → gift wrap)
+- [**NIP-40**](https://github.com/nostr-protocol/nips/blob/master/40.md) - Expiration Timestamp
 
-### Critical Requirements
+### Implementation Notes
 
 Per NIP-17, rumors (kind 14) must include:
 - `id` - SHA256 hash of `[0, pubkey, created_at, kind, tags, content]`
@@ -106,7 +106,7 @@ Some clients (e.g., 0xchat) reject messages missing these fields.
 
 ## Shared Test Vectors
 
-The [`test-vectors/`](test-vectors/) directory contains JSON test cases for NIP-17 compliance. All platform implementations should validate against these vectors.
+The [`test-vectors/`](test-vectors/) directory contains JSON test cases for NIP-17. All platform implementations should validate against these vectors.
 
 ## Symbolication
 
@@ -129,7 +129,7 @@ Contributions welcome for automated symbolication in the receiver CLI/WebUI.
 See [AGENTS.md](AGENTS.md) for contributor guidelines covering:
 - Documentation requirements
 - Commit conventions
-- NIP compliance notes
+- NIP implementation notes
 
 ## License
 

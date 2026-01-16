@@ -11,7 +11,7 @@ BugStr is a privacy-focused crash reporting library for Nostr applications. It u
 | Platform | Directory |
 |----------|-----------|
 | Android/Kotlin | `android/` |
-| TypeScript | `typescript/` |
+| Electron | `electron/` |
 | Flutter/Dart | `dart/` |
 | Rust | `rust/` |
 | Go | `go/` |
@@ -33,7 +33,7 @@ Ensure docstring coverage for any code added or modified:
 
 - **Kotlin**: Use KDoc format (`/** ... */`)
 - **Dart**: Use dartdoc format (`/// ...`)
-- **TypeScript**: Use JSDoc format (`/** ... */`)
+- **TypeScript/Electron**: Use JSDoc format (`/** ... */`)
 - **Rust**: Use rustdoc format (`/// ...` or `//!`)
 - **Go**: Use godoc format (comment before declaration)
 - **Python**: Use docstrings (`"""..."""`)
@@ -107,7 +107,7 @@ Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 
 ## NIP-17/59 Implementation Notes
 
-### Critical Compliance Requirements
+### Critical Implementation Requirements
 
 Based on integration testing with 0xchat and other clients:
 
@@ -149,7 +149,7 @@ bugstr/
 │   ├── bugstr-nostr-crypto/      # NIP-17/44/59 (Kotlin)
 │   ├── CHANGELOG.md
 │   └── README.md
-├── typescript/                   # TypeScript implementation
+├── electron/                     # Electron desktop app implementation
 │   ├── src/
 │   ├── CHANGELOG.md
 │   └── README.md
@@ -170,7 +170,7 @@ bugstr/
 ├── react-native/                 # React Native library
 │   ├── src/
 │   └── README.md
-├── test-vectors/                 # Shared NIP-17 compliance tests
+├── test-vectors/                 # Shared NIP-17 test vectors
 │   └── nip17-gift-wrap.json
 ├── AGENTS.md                     # This file (shared guidelines)
 ├── LICENSE

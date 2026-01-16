@@ -1,7 +1,7 @@
 {
-  "name": "bugstr-ts",
+  "name": "bugstr-electron",
   "version": "0.1.0",
-  "description": "Minimal Bugstr browser SDK (NIP-17 DM send, redaction, confirm hook)",
+  "description": "Bugstr crash reporting SDK for Electron desktop apps (NIP-17 DM)",
   "type": "module",
   "main": "./dist/cjs/index.cjs",
   "module": "./dist/esm/index.js",
@@ -23,14 +23,19 @@
   },
   "dependencies": {
     "@scure/base": "^2.0.0",
+    "electron-store": "^10.0.0",
     "nostr-tools": "^2.5.2"
+  },
+  "peerDependencies": {
+    "electron": ">=20.0.0"
   },
   "keywords": [
     "bugstr",
     "nostr",
     "nip17",
     "nip44",
-    "crash-reporting"
+    "crash-reporting",
+    "electron"
   ],
   "author": "",
   "license": "MIT",
