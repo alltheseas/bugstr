@@ -1,9 +1,15 @@
 /// Main Bugstr client for crash reporting.
+///
+/// For large crash reports (>50KB), uses CHK chunking:
+/// - Chunks are published as public events (kind 10422)
+/// - Manifest with root hash is gift-wrapped (kind 10421)
+/// - Only the recipient can decrypt chunks using the root hash
 library;
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:crypto/crypto.dart';
@@ -13,6 +19,8 @@ import 'package:ndk/ndk.dart';
 import 'config.dart';
 import 'payload.dart';
 import 'compression.dart';
+import 'transport.dart';
+import 'chunking.dart';
 
 /// Main entry point for Bugstr crash reporting.
 class Bugstr {
@@ -169,92 +177,161 @@ class Bugstr {
     unawaited(_sendToNostr(finalPayload));
   }
 
-  /// Send payload via NIP-17 gift wrap.
+  /// Build a NIP-17 gift-wrapped event for a rumor.
+  static Nip01Event _buildGiftWrap(int rumorKind, String content) {
+    final rumorCreatedAt = _randomPastTimestamp();
+    final rumorTags = [
+      ['p', _developerPubkeyHex!]
+    ];
+
+    final serialized = jsonEncode([
+      0,
+      _senderKeys!.publicKey,
+      rumorCreatedAt,
+      rumorKind,
+      rumorTags,
+      content,
+    ]);
+    final rumorId = sha256.convert(utf8.encode(serialized)).toString();
+
+    final rumor = {
+      'id': rumorId,
+      'pubkey': _senderKeys!.publicKey,
+      'created_at': rumorCreatedAt,
+      'kind': rumorKind,
+      'tags': rumorTags,
+      'content': content,
+      'sig': '',
+    };
+
+    final rumorJson = jsonEncode(rumor);
+
+    final sealContent = Nip44.encrypt(
+      _senderKeys!.privateKey,
+      _developerPubkeyHex!,
+      rumorJson,
+    );
+
+    final sealEvent = Nip01Event(
+      pubKey: _senderKeys!.publicKey,
+      kind: 13,
+      tags: [],
+      content: sealContent,
+      createdAt: _randomPastTimestamp(),
+    );
+    sealEvent.sign(_senderKeys!.privateKey);
+
+    final wrapperKeys = KeyPair.generate();
+    final giftContent = Nip44.encrypt(
+      wrapperKeys.privateKey,
+      _developerPubkeyHex!,
+      sealEvent.toJsonString(),
+    );
+
+    final giftWrap = Nip01Event(
+      pubKey: wrapperKeys.publicKey,
+      kind: 1059,
+      tags: [
+        ['p', _developerPubkeyHex!]
+      ],
+      content: giftContent,
+      createdAt: _randomPastTimestamp(),
+    );
+    giftWrap.sign(wrapperKeys.privateKey);
+
+    return giftWrap;
+  }
+
+  /// Build a public chunk event (kind 10422).
+  static Nip01Event _buildChunkEvent(ChunkData chunk) {
+    final chunkKeys = KeyPair.generate();
+    final chunkPayloadData = ChunkPayload(
+      index: chunk.index,
+      hash: encodeChunkHash(chunk),
+      data: encodeChunkData(chunk),
+    );
+
+    final event = Nip01Event(
+      pubKey: chunkKeys.publicKey,
+      kind: kindChunk,
+      tags: [],
+      content: jsonEncode(chunkPayloadData.toJson()),
+      createdAt: _randomPastTimestamp(),
+    );
+    event.sign(chunkKeys.privateKey);
+    return event;
+  }
+
+  /// Publish event to first successful relay.
+  static Future<void> _publishToRelays(Nip01Event event) async {
+    for (final relayUrl in _config!.effectiveRelays) {
+      try {
+        await _publishToRelay(relayUrl, event);
+        return;
+      } catch (e) {
+        debugPrint('Bugstr: Failed to publish to $relayUrl: $e');
+      }
+    }
+  }
+
+  /// Publish event to all relays (for chunk redundancy).
+  static Future<void> _publishToAllRelays(Nip01Event event) async {
+    final futures = _config!.effectiveRelays.map((url) async {
+      try {
+        await _publishToRelay(url, event);
+      } catch (e) {
+        debugPrint('Bugstr: Failed to publish chunk to $url: $e');
+      }
+    });
+    await Future.wait(futures);
+  }
+
+  /// Send payload via NIP-17 gift wrap, using chunking for large payloads.
   static Future<void> _sendToNostr(CrashPayload payload) async {
     if (_senderKeys == null || _developerPubkeyHex == null || _config == null) {
       return;
     }
 
     try {
-      // Prepare content (maybe compress)
       final plaintext = payload.toJsonString();
       final content = maybeCompressPayload(plaintext);
+      final payloadBytes = Uint8List.fromList(utf8.encode(content));
+      final transportKind = getTransportKind(payloadBytes.length);
 
-      // Build rumor (kind 14, unsigned)
-      final rumorCreatedAt = _randomPastTimestamp();
-      final rumorTags = [
-        ['p', _developerPubkeyHex!]
-      ];
+      if (transportKind == TransportKind.direct) {
+        // Small payload: direct gift-wrapped delivery
+        final directPayload = DirectPayload(crash: payload.toJson());
+        final giftWrap = _buildGiftWrap(kindDirect, jsonEncode(directPayload.toJson()));
+        await _publishToRelays(giftWrap);
+        debugPrint('Bugstr: sent direct crash report');
+      } else {
+        // Large payload: chunked delivery
+        debugPrint('Bugstr: payload ${payloadBytes.length} bytes, using chunked transport');
 
-      // Compute rumor ID per NIP-01
-      final serialized = jsonEncode([
-        0,
-        _senderKeys!.publicKey,
-        rumorCreatedAt,
-        14,
-        rumorTags,
-        content,
-      ]);
-      final rumorId = sha256.convert(utf8.encode(serialized)).toString();
+        final result = chunkPayload(payloadBytes);
+        debugPrint('Bugstr: split into ${result.chunks.length} chunks');
 
-      final rumor = {
-        'id': rumorId,
-        'pubkey': _senderKeys!.publicKey,
-        'created_at': rumorCreatedAt,
-        'kind': 14,
-        'tags': rumorTags,
-        'content': content,
-        'sig': '', // Empty for rumors per NIP-17
-      };
-
-      final rumorJson = jsonEncode(rumor);
-
-      // Encrypt into seal (kind 13) using NIP-44
-      final sealContent = Nip44.encrypt(
-        _senderKeys!.privateKey,
-        _developerPubkeyHex!,
-        rumorJson,
-      );
-
-      final sealEvent = Nip01Event(
-        pubKey: _senderKeys!.publicKey,
-        kind: 13,
-        tags: [],
-        content: sealContent,
-        createdAt: _randomPastTimestamp(),
-      );
-      sealEvent.sign(_senderKeys!.privateKey);
-
-      // Wrap in gift wrap (kind 1059) with ephemeral key
-      final wrapperKeys = KeyPair.generate();
-      final giftContent = Nip44.encrypt(
-        wrapperKeys.privateKey,
-        _developerPubkeyHex!,
-        sealEvent.toJsonString(),
-      );
-
-      final giftWrap = Nip01Event(
-        pubKey: wrapperKeys.publicKey,
-        kind: 1059,
-        tags: [
-          ['p', _developerPubkeyHex!]
-        ],
-        content: giftContent,
-        createdAt: _randomPastTimestamp(),
-      );
-      giftWrap.sign(wrapperKeys.privateKey);
-
-      // Publish to relays
-      for (final relayUrl in _config!.effectiveRelays) {
-        try {
-          await _publishToRelay(relayUrl, giftWrap);
-          return; // Success on first relay
-        } catch (e) {
-          debugPrint('Bugstr: Failed to publish to $relayUrl: $e');
+        // Build and publish chunk events
+        final chunkIds = <String>[];
+        for (final chunk in result.chunks) {
+          final chunkEvent = _buildChunkEvent(chunk);
+          chunkIds.add(chunkEvent.id);
+          await _publishToAllRelays(chunkEvent);
         }
+        debugPrint('Bugstr: published ${result.chunks.length} chunks');
+
+        // Build and publish manifest
+        final manifest = ManifestPayload(
+          rootHash: result.rootHash,
+          totalSize: result.totalSize,
+          chunkCount: result.chunks.length,
+          chunkIds: chunkIds,
+        );
+        final manifestGiftWrap = _buildGiftWrap(kindManifest, jsonEncode(manifest.toJson()));
+        await _publishToRelays(manifestGiftWrap);
+        debugPrint('Bugstr: sent chunked crash report manifest');
       }
     } catch (e) {
-      // Silent failure - don't crash the app
       debugPrint('Bugstr: Failed to send crash report: $e');
     }
   }
