@@ -1153,12 +1153,31 @@ fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<Rumor, Box<dyn std
         return Err(format!("Invalid seal kind: expected 13, got {}", seal.kind.as_u16()).into());
     }
 
+    // Verify seal tags are empty (NIP-59: seal tags MUST be empty)
+    if !seal.tags.is_empty() {
+        return Err("Invalid seal: tags must be empty".into());
+    }
+
     // Verify seal signature (NIP-59: seal is signed by sender)
     seal.verify()?;
 
     // Decrypt seal to get rumor (unsigned, so parse as Rumor not Event)
     let rumor_json = nip44::decrypt(keys.secret_key(), &seal.pubkey, &seal.content)?;
     let rumor: Rumor = serde_json::from_str(&rumor_json)?;
+
+    // Verify rumor sig is empty (NIP-59: rumors are unsigned)
+    if !rumor.sig.is_empty() {
+        return Err("Invalid rumor: sig must be empty".into());
+    }
+
+    // Verify seal.pubkey matches rumor.pubkey (NIP-17: prevent sender spoofing)
+    if seal.pubkey.to_hex() != rumor.pubkey {
+        return Err(format!(
+            "Sender spoofing detected: seal.pubkey ({}) != rumor.pubkey ({})",
+            &seal.pubkey.to_hex()[..16],
+            &rumor.pubkey[..16]
+        ).into());
+    }
 
     Ok(rumor)
 }

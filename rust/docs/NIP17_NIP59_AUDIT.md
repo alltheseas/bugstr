@@ -260,11 +260,14 @@ These are application-specific kinds and don't conflict with NIP-17/NIP-59. The 
 - [x] Add `gift_wrap.verify()` call in Rust receiver
 - [x] Add `seal.verify()` call in Rust receiver
 - [x] Add `seal.kind == 13` validation in Rust receiver
+- [x] Add `seal.tags` empty validation (NIP-59)
+- [x] Add `rumor.sig` empty validation (NIP-59)
+- [x] Add `seal.pubkey == rumor.pubkey` validation (NIP-17: prevent sender spoofing)
 
 ### Priority 2 (Medium) - Spec Violations - FIXED 2026-01-16
 - [x] **Fix rumor timestamp**: All SDKs now use actual message time for rumor `created_at`, only randomize seal/gift-wrap
 - [x] **Fix Android seal tags**: Removed expiration tag from seal (kept on gift-wrap only)
-- [ ] **Consider sender gift-wrap**: Intentionally skipped for crash reporting (sender doesn't need to read back crash reports)
+- [x] **Sender gift-wrap**: Intentionally skipped - crash reporters don't need to read back their own reports (documented deviation from NIP-17 MUST)
 
 ### Priority 3 (Feature Gaps)
 - [ ] ~~Add reply threading support (e-tag) to Go, Python, RN, Dart, Electron SDKs~~ - Not needed for crash reporting
