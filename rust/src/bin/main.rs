@@ -3,7 +3,10 @@
 //! Subscribes to Nostr relays and decrypts NIP-17 gift-wrapped crash reports.
 //! Optionally serves a web dashboard for viewing and analyzing crashes.
 
-use bugstr::{decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router};
+use bugstr::{
+    decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
+    MappingStore, Platform, Symbolicator, SymbolicationContext,
+};
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -63,6 +66,10 @@ enum Commands {
         /// Database file path
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
+
+        /// Directory containing mapping files for symbolication
+        #[arg(long)]
+        mappings: Option<PathBuf>,
     },
 
     /// Show your receiver pubkey (npub)
@@ -71,6 +78,33 @@ enum Commands {
         #[arg(short, long, env = "BUGSTR_PRIVKEY")]
         privkey: String,
     },
+
+    /// Symbolicate a stack trace using mapping files
+    Symbolicate {
+        /// Platform: android, electron, flutter, rust, go, python, react-native
+        #[arg(short = 'P', long)]
+        platform: String,
+
+        /// Input file containing stack trace (or - for stdin)
+        #[arg(short, long, default_value = "-")]
+        input: String,
+
+        /// Directory containing mapping files
+        #[arg(short, long, default_value = "mappings")]
+        mappings: PathBuf,
+
+        /// Application ID (package name, bundle id, etc.)
+        #[arg(short, long)]
+        app_id: Option<String>,
+
+        /// Application version
+        #[arg(short, long)]
+        version: Option<String>,
+
+        /// Output format: pretty or json
+        #[arg(short, long, default_value = "pretty")]
+        format: SymbolicateFormat,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -78,6 +112,12 @@ enum OutputFormat {
     Pretty,
     Json,
     Raw,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum SymbolicateFormat {
+    Pretty,
+    Json,
 }
 
 /// A received crash report ready for storage.
@@ -105,11 +145,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relays,
             port,
             db,
+            mappings,
         } => {
-            serve(&privkey, &relays, port, db).await?;
+            serve(&privkey, &relays, port, db, mappings).await?;
         }
         Commands::Pubkey { privkey } => {
             show_pubkey(&privkey)?;
+        }
+        Commands::Symbolicate {
+            platform,
+            input,
+            mappings,
+            app_id,
+            version,
+            format,
+        } => {
+            symbolicate_stack(&platform, &input, &mappings, app_id, version, format)?;
         }
     }
 
@@ -140,12 +191,232 @@ fn show_pubkey(privkey: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Symbolicate a stack trace using mapping files.
+///
+/// Reads a stack trace from a file or stdin, symbolicates it using the appropriate
+/// platform-specific symbolicator, and outputs the result in the specified format.
+///
+/// # Parameters
+///
+/// * `platform_str` - Platform identifier string. Supported values:
+///   - `"android"` - Android (ProGuard/R8 mapping files)
+///   - `"electron"` or `"javascript"` or `"js"` - JavaScript/Electron (source maps)
+///   - `"flutter"` or `"dart"` - Flutter/Dart (symbol files)
+///   - `"rust"` - Rust (backtrace parsing)
+///   - `"go"` or `"golang"` - Go (goroutine stacks)
+///   - `"python"` - Python (traceback parsing)
+///   - `"react-native"` or `"reactnative"` or `"rn"` - React Native (Hermes + source maps)
+///   Unknown platforms trigger a warning but still attempt symbolication.
+///
+/// * `input` - Path to file containing the stack trace, or `"-"` to read from stdin.
+///   The file is read entirely into memory as UTF-8 text.
+///
+/// * `mappings_dir` - Borrowed reference to the directory containing mapping files.
+///   Expected structure: `<root>/<platform>/<app_id>/<version>/<mapping_file>`.
+///   See [`MappingStore`] for detailed directory layout.
+///
+/// * `app_id` - Optional application identifier (e.g., package name, bundle ID).
+///   Used to locate the correct mapping file. If `None`, defaults to `"unknown"`.
+///
+/// * `version` - Optional application version string (e.g., `"1.0.0"`).
+///   Used to locate the correct mapping file. If `None`, defaults to `"unknown"`.
+///   Falls back to newest available version if exact match not found.
+///
+/// * `format` - Output format selection. See [`SymbolicateFormat`]:
+///   - `Pretty` - Human-readable colored output with frame numbers and source locations
+///   - `Json` - Machine-readable JSON with full frame details
+///
+/// # Returns
+///
+/// * `Ok(())` - Symbolication completed (results printed to stdout)
+/// * `Err(_)` - One of the following errors occurred:
+///   - IO error reading input file or stdin
+///   - [`SymbolicationError::MappingNotFound`] - No mapping file for platform/app/version
+///   - [`SymbolicationError::ParseError`] - Failed to parse mapping file
+///   - [`SymbolicationError::IoError`] - Failed to read mapping file
+///   - [`SymbolicationError::UnsupportedPlatform`] - Platform::Unknown was provided
+///   - JSON serialization error (for JSON format output)
+///
+/// # Output Format
+///
+/// **Pretty format** (default):
+/// ```text
+/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Symbolication Results 5 frames symbolicated (83.3%)
+/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+///
+///   #0 com.example.MyClass.myMethod (MyClass.java:42)
+///   #1 com.example.OtherClass.call (OtherClass.java:15)
+/// ```
+///
+/// **JSON format**:
+/// ```json
+/// {
+///   "symbolicated_count": 5,
+///   "total_count": 6,
+///   "percentage": 83.33,
+///   "frames": [
+///     {
+///       "raw": "at a.b.c(Unknown:1)",
+///       "function": "com.example.MyClass.myMethod",
+///       "file": "MyClass.java",
+///       "line": 42,
+///       "column": null,
+///       "symbolicated": true
+///     }
+///   ]
+/// }
+/// ```
+///
+/// # Side Effects
+///
+/// - Reads from filesystem (input file and mapping files)
+/// - Reads from stdin if `input` is `"-"`
+/// - Writes to stdout (symbolication results)
+/// - Writes to stderr (warnings for unknown platform, missing mappings)
+/// - Creates mapping directory if it doesn't exist (via [`MappingStore::scan`])
+///
+/// # Panics
+///
+/// This function does not panic under normal operation. All errors are returned
+/// as `Result::Err`.
+///
+/// # Example
+///
+/// ```ignore
+/// // Symbolicate an Android stack trace from a file
+/// symbolicate_stack(
+///     "android",
+///     "crash.txt",
+///     &PathBuf::from("./mappings"),
+///     Some("com.myapp".to_string()),
+///     Some("1.0.0".to_string()),
+///     SymbolicateFormat::Pretty,
+/// )?;
+///
+/// // Symbolicate from stdin with JSON output
+/// symbolicate_stack(
+///     "python",
+///     "-",
+///     &PathBuf::from("./mappings"),
+///     None,
+///     None,
+///     SymbolicateFormat::Json,
+/// )?;
+/// ```
+fn symbolicate_stack(
+    platform_str: &str,
+    input: &str,
+    mappings_dir: &PathBuf,
+    app_id: Option<String>,
+    version: Option<String>,
+    format: SymbolicateFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read stack trace
+    let stack_trace = if input == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(input)?
+    };
+
+    // Parse platform
+    let platform = Platform::from_str(platform_str);
+    if matches!(platform, Platform::Unknown(_)) {
+        eprintln!(
+            "{} Unknown platform '{}'. Supported: android, electron, flutter, rust, go, python, react-native",
+            "warning".yellow(),
+            platform_str
+        );
+    }
+
+    // Create symbolicator with scanned mapping store
+    let mut store = MappingStore::new(mappings_dir);
+    let count = store.scan()?;
+    if count == 0 {
+        eprintln!(
+            "{} No mapping files found in {}",
+            "warning".yellow(),
+            mappings_dir.display()
+        );
+    }
+    let symbolicator = Symbolicator::new(store);
+
+    // Create context
+    let context = SymbolicationContext {
+        platform,
+        app_id,
+        version,
+        build_id: None,
+    };
+
+    // Symbolicate
+    let result = symbolicator.symbolicate(&stack_trace, &context)?;
+
+    // Output
+    match format {
+        SymbolicateFormat::Pretty => {
+            println!("{}", "━".repeat(60).dimmed());
+            println!(
+                "{} {} frames symbolicated ({:.1}%)",
+                "Symbolication Results".green().bold(),
+                result.symbolicated_count,
+                result.percentage()
+            );
+            println!("{}", "━".repeat(60).dimmed());
+            println!();
+
+            for (i, frame) in result.frames.iter().enumerate() {
+                if frame.symbolicated {
+                    let location = match (&frame.file, frame.line) {
+                        (Some(f), Some(l)) => format!(" ({}:{})", f.dimmed(), l),
+                        (Some(f), None) => format!(" ({})", f.dimmed()),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "  {} {}{}",
+                        format!("#{}", i).cyan(),
+                        frame.function.as_deref().unwrap_or("<unknown>").green(),
+                        location
+                    );
+                } else {
+                    println!("  {} {}", format!("#{}", i).cyan(), frame.raw.dimmed());
+                }
+            }
+            println!();
+        }
+        SymbolicateFormat::Json => {
+            let output = serde_json::json!({
+                "symbolicated_count": result.symbolicated_count,
+                "total_count": result.total_count,
+                "percentage": result.percentage(),
+                "frames": result.frames.iter().map(|f| {
+                    serde_json::json!({
+                        "raw": f.raw,
+                        "function": f.function,
+                        "file": f.file,
+                        "line": f.line,
+                        "column": f.column,
+                        "symbolicated": f.symbolicated,
+                    })
+                }).collect::<Vec<_>>()
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+    }
+
+    Ok(())
+}
+
 /// Run web dashboard with crash collection.
 async fn serve(
     privkey: &str,
     relays: &[String],
     port: u16,
     db_path: PathBuf,
+    mappings_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let secret = parse_privkey(privkey)?;
     let keys = Keys::new(secret);
@@ -153,7 +424,36 @@ async fn serve(
 
     // Open/create database
     let storage = CrashStorage::open(&db_path)?;
-    let state = Arc::new(AppState { storage: Mutex::new(storage) });
+
+    // Create symbolicator if mappings directory is provided
+    let symbolicator = if let Some(ref dir) = mappings_dir {
+        let mut store = MappingStore::new(dir);
+        match store.scan() {
+            Ok(count) => {
+                if count == 0 {
+                    eprintln!(
+                        "{} No mapping files found in {}",
+                        "warning".yellow(),
+                        dir.display()
+                    );
+                } else {
+                    println!("  {} {} mapping files loaded", "Loaded:".cyan(), count);
+                }
+                Some(Arc::new(Symbolicator::new(store)))
+            }
+            Err(e) => {
+                eprintln!("{} Failed to scan mappings: {}", "error".red(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let state = Arc::new(AppState {
+        storage: Mutex::new(storage),
+        symbolicator,
+    });
 
     println!("{}", "━".repeat(60).dimmed());
     println!(
@@ -165,6 +465,9 @@ async fn serve(
     println!("  {} {}", "Database:".cyan(), db_path.display());
     println!("  {} http://localhost:{}", "Dashboard:".cyan(), port);
     println!("  {} {}", "Relays:".cyan(), relays.join(", "));
+    if let Some(ref dir) = mappings_dir {
+        println!("  {} {}", "Mappings:".cyan(), dir.display());
+    }
     println!("{}", "━".repeat(60).dimmed());
     println!();
 

@@ -26,11 +26,16 @@
 pub mod compression;
 pub mod event;
 pub mod storage;
+pub mod symbolication;
 pub mod web;
 
 pub use compression::{compress_payload, decompress_payload, maybe_compress_payload, DEFAULT_THRESHOLD};
 pub use event::UnsignedNostrEvent;
 pub use storage::{CrashReport, CrashGroup, CrashStorage, parse_crash_content};
+pub use symbolication::{
+    MappingStore, Platform, Symbolicator, SymbolicatedFrame, SymbolicatedStack,
+    SymbolicationContext, SymbolicationError,
+};
 pub use web::{create_router, AppState};
 
 /// Configuration for the crash report handler.
