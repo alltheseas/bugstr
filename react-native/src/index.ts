@@ -352,8 +352,8 @@ async function publishChunkWithVerify(
       // Publish with rate limiting
       await publishChunkToRelay(relayUrl, event);
 
-      // Brief delay before verification
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Brief delay before verification to allow relay to process
+      await new Promise((resolve) => setTimeout(resolve, 500));
 
       // Verify the chunk exists
       if (await verifyChunkExists(relayUrl, event.id)) {

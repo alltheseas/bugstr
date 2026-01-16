@@ -370,8 +370,8 @@ class Bugstr {
         // Publish with rate limiting
         await _publishChunkToRelay(relayUrl, event);
 
-        // Brief delay before verification
-        await Future.delayed(const Duration(milliseconds: 100));
+        // Brief delay before verification to allow relay to process
+        await Future.delayed(const Duration(milliseconds: 500));
 
         // Verify the chunk exists
         if (await _verifyChunkExists(relayUrl, event.id)) {

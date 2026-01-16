@@ -587,8 +587,8 @@ def _publish_chunk_with_verify(event: Event, relays: list[str], start_index: int
         if not _publish_chunk_to_relay(event, relay_url):
             continue  # Try next relay
 
-        # Brief delay before verification
-        time.sleep(0.1)
+        # Brief delay before verification to allow relay to process
+        time.sleep(0.5)
 
         # Verify the chunk exists
         if _verify_chunk_exists(event_id, relay_url):

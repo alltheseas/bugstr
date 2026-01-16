@@ -676,7 +676,7 @@ func publishChunkWithVerify(ctx context.Context, relays []string, startIndex int
 		}
 
 		// Brief delay before verification to allow relay to process
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 
 		// Verify the chunk exists on the relay
 		if verifyChunkExists(ctx, relayURL, event.ID) {

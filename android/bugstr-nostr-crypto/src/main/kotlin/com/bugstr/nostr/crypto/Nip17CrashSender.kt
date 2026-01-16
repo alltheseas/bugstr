@@ -124,8 +124,8 @@ class Nip17CrashSender(
                 continue // Try next relay
             }
 
-            // Brief delay before verification
-            kotlinx.coroutines.delay(100)
+            // Brief delay before verification to allow relay to process
+            kotlinx.coroutines.delay(500)
 
             // Verify the chunk exists
             if (publisher.verifyChunkExists(chunk.id, relayUrl)) {
