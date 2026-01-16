@@ -275,19 +275,56 @@ async fn fetch_chunks(manifest: &Manifest, default_relays: &[String]) -> Result<
 }
 ```
 
+## Reliability Analysis
+
+With 4 relays and publish verification + retry, each chunk gets 4 attempts before failing.
+
+**Math:**
+- p = single relay failure rate (1 - reliability)
+- P(chunk fails) = p⁴ (all 4 relays must fail)
+- P(report fails) = 1 - (1 - p⁴)³⁰ (at least 1 of 30 chunks lost)
+
+| Relay Reliability | Single Relay Failure | Chunk Failure (p⁴) | 30-Chunk Report Success |
+|-------------------|---------------------|-------------------|------------------------|
+| 80%               | 20%                 | 0.16%             | **95.3%**              |
+| 90%               | 10%                 | 0.01%             | **99.7%**              |
+| 95%               | 5%                  | 0.000625%         | **99.98%**             |
+| 98%               | 2%                  | 0.000016%         | **99.9995%**           |
+
+The 4-relay retry provides exponential improvement. Even with 80% individual relay reliability,
+a 30-chunk report has 95%+ success rate. With typical relay reliability (95%+), failure is
+effectively negligible.
+
+**Future Enhancement:** Query [nostr.watch](https://nostr.watch) for real-time relay uptime
+and dynamically select most reliable relays.
+
+### Reliability Enhancement Options
+
+| Approach | Description | Reliability | Upload Time | Bandwidth | Complexity | Works While Crashing |
+|----------|-------------|-------------|-------------|-----------|------------|---------------------|
+| **Current (verify+retry)** | Publish, verify, retry on different relay | 99.98% @ 95% relay | 1x | 1x | Low | ✅ Yes |
+| **Redundant Publishing** | Publish each chunk to 2 relays | 99.9999% @ 95% relay | 2x | 2x | Low | ✅ Yes |
+| **Erasure Coding** | 30 data + 10 parity chunks, need any 30 | 99.9999%+ (tolerates 25% loss) | 1.33x | 1.33x | High | ✅ Yes |
+| **Bidirectional Requests** | Receiver asks sender for missing chunks | ~100% (if sender online) | 1x + retry | 1x + retry | Medium | ❌ No |
+| **Hybrid (optional bidir)** | Fire-and-forget + optional 60s listen | 99.98% → ~100% | 1x + optional | 1x + optional | Medium | ⚠️ Partial |
+
+**Recommendation:** Current approach (verify+retry) provides 99.98% reliability with minimal complexity.
+Consider erasure coding if higher reliability needed without bidirectional communication.
+
 ## Redundancy Considerations
 
 **Option A: Single relay per chunk (fastest, less redundant)**
 - Each chunk goes to 1 relay
 - Risk: If relay goes down, chunk is lost
-- Mitigation: Receiver queries all relays anyway (cross-relay aggregation)
+- Mitigation: Publish verification + retry across all 4 relays
 
 **Option B: Two relays per chunk (balanced)**
 - Each chunk goes to 2 relays (staggered round-robin)
 - Better redundancy, slightly slower
 - Example: chunk 0 → [damus, nos.lol], chunk 1 → [nos.lol, primal]
 
-**Recommendation: Option A** - Cross-relay aggregation already provides resilience. The receiver will query all relays for missing chunks.
+**Recommendation: Option A with verification** - Publish verification + retry provides
+sufficient resilience without the overhead of dual publishing.
 
 ## Files to Modify
 
