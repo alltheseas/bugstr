@@ -158,7 +158,7 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
 
   // Seal (kind 13)
   const conversationKey = nip44.getConversationKey(senderPrivkey, developerPubkeyHex);
-  const sealContent = await nip44.encrypt(JSON.stringify(unsignedKind14), conversationKey);
+  const sealContent = nip44.encrypt(JSON.stringify(unsignedKind14), conversationKey);
   const seal = finalizeEvent(
     {
       kind: 13,
@@ -172,7 +172,7 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
   // Gift wrap (kind 1059)
   const wrapperPrivBytes = generateSecretKey();
   const wrapKey = nip44.getConversationKey(wrapperPrivBytes, developerPubkeyHex);
-  const giftWrapContent = await nip44.encrypt(JSON.stringify(seal), wrapKey);
+  const giftWrapContent = nip44.encrypt(JSON.stringify(seal), wrapKey);
   const giftWrap = finalizeEvent(
     {
       kind: 1059,
@@ -213,11 +213,19 @@ async function nativeConfirm(summary: BugstrSummary): Promise<boolean> {
 }
 
 async function maybeSend(payload: BugstrPayload): Promise<void> {
+  // Apply beforeSend hook first (may modify or drop the payload)
+  const finalPayload = config.beforeSend === undefined ? payload : config.beforeSend(payload);
+  if (finalPayload === null) return;
+
+  const payloadToSend = finalPayload || payload;
+
+  // Build summary from the (potentially modified) payload
   const summary: BugstrSummary = {
-    message: payload.message,
-    stackPreview: payload.stack ? payload.stack.split('\n').slice(0, 3).join('\n') : undefined,
+    message: payloadToSend.message,
+    stackPreview: payloadToSend.stack ? payloadToSend.stack.split('\n').slice(0, 3).join('\n') : undefined,
   };
 
+  // Confirm with user
   let shouldSend: boolean;
   if (config.confirmSend) {
     shouldSend = await config.confirmSend(summary);
@@ -229,10 +237,7 @@ async function maybeSend(payload: BugstrPayload): Promise<void> {
 
   if (!shouldSend) return;
 
-  const finalPayload = config.beforeSend === undefined ? payload : config.beforeSend(payload);
-  if (finalPayload === null) return;
-
-  await sendToNostr(finalPayload || payload);
+  await sendToNostr(payloadToSend);
 }
 
 // Public API

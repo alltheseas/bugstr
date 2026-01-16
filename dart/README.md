@@ -71,10 +71,10 @@ Bugstr.init(
 
 ## Default Relays
 
-| Relay | Max Size | Notes |
-|-------|----------|-------|
-| `wss://relay.damus.io` | 1 MB | Primary |
-| `wss://relay.primal.net` | 1 MB | Secondary |
+| Relay | Max Event Size | Notes |
+|-------|----------------|-------|
+| `wss://relay.damus.io` | 64 KB | strfry defaults |
+| `wss://relay.primal.net` | 64 KB | strfry defaults |
 | `wss://nos.lol` | 128 KB | Fallback |
 
 ## Compression

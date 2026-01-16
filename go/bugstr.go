@@ -207,7 +207,11 @@ func decodePubkey(pubkey string) string {
 		if err != nil || prefix != "npub" {
 			return ""
 		}
-		return data.(string)
+		s, ok := data.(string)
+		if !ok {
+			return ""
+		}
+		return s
 	}
 	return pubkey
 }

@@ -1,12 +1,12 @@
 /// Configuration for Bugstr crash reporting.
 library;
 
-/// Default relay URLs chosen for reliability and generous size limits.
+/// Default relay URLs chosen for reliability.
 ///
-/// | Relay | Max Size |
-/// |-------|----------|
-/// | relay.damus.io | 1 MB |
-/// | relay.primal.net | 1 MB |
+/// | Relay | Max Event Size |
+/// |-------|----------------|
+/// | relay.damus.io | 64 KB (strfry default) |
+/// | relay.primal.net | 64 KB (strfry default) |
 /// | nos.lol | 128 KB |
 const List<String> defaultRelays = [
   'wss://relay.damus.io',

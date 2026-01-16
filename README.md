@@ -32,13 +32,15 @@ Crash → Cache locally → App restart → Show consent dialog → User approve
 
 ## Default Relays
 
-All SDKs use the same default relay list, chosen for reliability and generous size limits:
+All SDKs use the same default relay list, chosen for reliability:
 
-| Relay | Max Message Size | Notes |
-|-------|------------------|-------|
-| `wss://relay.damus.io` | 1 MB | Primary relay |
-| `wss://relay.primal.net` | 1 MB | Secondary relay |
-| `wss://nos.lol` | 128 KB | Fallback relay |
+| Relay | Max Event Size | Max WebSocket | Notes |
+|-------|----------------|---------------|-------|
+| `wss://relay.damus.io` | 64 KB | 128 KB | strfry defaults |
+| `wss://relay.primal.net` | 64 KB | 128 KB | strfry defaults |
+| `wss://nos.lol` | 128 KB | 128 KB | Fallback relay |
+
+**Note:** Most relays use strfry defaults (64 KB event size, 128 KB websocket payload). The practical limit for crash reports is ~60 KB to allow for gift-wrap envelope overhead.
 
 You can override these defaults via the `relays` configuration option in each SDK.
 
@@ -83,7 +85,7 @@ Gzip typically achieves **70-90% reduction** on stack traces due to their repeti
 | 50 KB | ~5-10 KB | ~80-90% |
 | 200 KB | ~20-40 KB | ~80-85% |
 
-With the default relays (1 MB limit), even uncompressed 200 KB stack traces transmit without issue. For maximum compatibility across all relays, the 60 KB practical limit allows ~300 KB of uncompressed stack trace data.
+With gzip compression (70-90% reduction), most crash reports fit well within the 64 KB strfry default limit. For maximum compatibility, keep compressed payloads under 60 KB.
 
 ## NIP Compliance
 
