@@ -135,8 +135,9 @@ function removeReport(id: string): void {
   store.set("pendingReports", reports.filter((r) => r.id !== id));
 }
 
-/** Clear all pending reports */
+/** Clear all pending reports. No-op if not initialized. */
 export function clearPendingReports(): void {
+  if (!initialized) return;
   store.set("pendingReports", []);
 }
 
