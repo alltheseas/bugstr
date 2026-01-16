@@ -30,9 +30,29 @@ Crash → Cache locally → App restart → Show consent dialog → User approve
 4. **NIP-17 DM** - Encrypted, gift-wrapped message sent to developer
 5. **Auto-expiration** - Report deleted from relays after 30 days
 
+## Default Relays
+
+All SDKs use the same default relay list, chosen for reliability and generous size limits:
+
+| Relay | Max Message Size | Notes |
+|-------|------------------|-------|
+| `wss://relay.damus.io` | 1 MB | Primary relay |
+| `wss://relay.primal.net` | 1 MB | Secondary relay |
+| `wss://nos.lol` | 128 KB | Fallback relay |
+
+You can override these defaults via the `relays` configuration option in each SDK.
+
 ## Size Limits & Compression
 
-Crash reports are subject to relay message size limits (typically 64KB-512KB depending on relay).
+Crash reports are subject to relay message size limits (see [NIP-11](https://nips.nostr.com/11) `max_message_length`).
+
+| Relay Limit | Compatibility |
+|-------------|---------------|
+| 64 KB | ~99% of relays |
+| 128 KB | ~90% of relays |
+| 512 KB+ | Major relays only |
+
+**Practical limit:** Keep compressed payloads under **60 KB** for universal delivery (allows ~500 bytes for gift-wrap envelope overhead).
 
 | Payload Size | Behavior |
 |--------------|----------|
@@ -51,7 +71,7 @@ Large payloads are wrapped in a versioned envelope:
 }
 ```
 
-Stack traces are automatically truncated to fit within limits (default: 200KB before compression). The receiver CLI/WebUI automatically detects and decompresses payloads.
+Stack traces are automatically truncated to fit within limits (default: 200 KB before compression). The receiver CLI/WebUI automatically detects and decompresses payloads.
 
 ### Compression Efficiency
 
@@ -63,7 +83,7 @@ Gzip typically achieves **70-90% reduction** on stack traces due to their repeti
 | 50 KB | ~5-10 KB | ~80-90% |
 | 200 KB | ~20-40 KB | ~80-85% |
 
-This allows most crash reports to fit comfortably within relay limits even with large stack traces.
+With the default relays (1 MB limit), even uncompressed 200 KB stack traces transmit without issue. For maximum compatibility across all relays, the 60 KB practical limit allows ~300 KB of uncompressed stack trace data.
 
 ## NIP Compliance
 

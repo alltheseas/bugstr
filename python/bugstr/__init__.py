@@ -51,7 +51,7 @@ __all__ = [
 ]
 
 # Default configuration
-DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol"]
+DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"]
 
 DEFAULT_REDACTIONS = [
     re.compile(r"cashuA[a-zA-Z0-9]+"),

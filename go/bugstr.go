@@ -40,7 +40,7 @@ type Config struct {
 	DeveloperPubkey string
 
 	// Relays to publish crash reports to.
-	// Defaults to ["wss://relay.damus.io", "wss://nos.lol"].
+	// Defaults to ["wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"].
 	Relays []string
 
 	// Environment tag (e.g., "production", "staging").
@@ -91,7 +91,7 @@ var (
 	initialized      bool
 	initMu           sync.Mutex
 
-	defaultRelays = []string{"wss://relay.damus.io", "wss://nos.lol"}
+	defaultRelays = []string{"wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"}
 
 	defaultRedactions = []*regexp.Regexp{
 		regexp.MustCompile(`cashuA[a-zA-Z0-9]+`),

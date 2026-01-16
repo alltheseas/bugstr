@@ -66,7 +66,7 @@ const DEFAULT_REDACTIONS: RegExp[] = [
   /https?:\/\/[^\s"]*\/mint[^\s"]*/gi,
 ];
 
-const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
+const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://relay.primal.net', 'wss://nos.lol'];
 
 // Global state
 let initialized = false;
