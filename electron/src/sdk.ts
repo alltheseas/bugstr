@@ -167,9 +167,10 @@ function buildGiftWrap(
   senderPrivkey: Uint8Array,
   recipientPubkey: string
 ): ReturnType<typeof finalizeEvent> {
+  // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
   const rumorEvent = {
     kind: rumorKind,
-    created_at: randomPastTimestamp(),
+    created_at: Math.floor(Date.now() / 1000),
     tags: [["p", recipientPubkey]],
     content,
     pubkey: getPublicKey(senderPrivkey),

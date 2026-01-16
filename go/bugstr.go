@@ -488,10 +488,11 @@ func maybeCompress(plaintext string) string {
 func buildGiftWrap(rumorKind int, content string) (nostr.Event, error) {
 	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
 
+	// NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
 	rumor := map[string]interface{}{
 		"id":         "",
 		"pubkey":     senderPubkey,
-		"created_at": randomPastTimestamp(),
+		"created_at": time.Now().Unix(),
 		"kind":       rumorKind,
 		"tags":       [][]string{{"p", developerPubkeyHex}},
 		"content":    content,

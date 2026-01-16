@@ -29,17 +29,17 @@ class Nip17PayloadBuilder(
         require(request.senderPrivateKeyHex.isNotBlank()) { "Sender private key is required." }
         require(request.senderPubKey.isNotBlank()) { "Sender pubkey is required." }
 
-        val rumor = buildRumor(request)
-        val createdAt = timestampRandomizer.randomize(Instant.now().epochSecond)
+        // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
+        val now = Instant.now().epochSecond
+        val rumor = buildRumor(request).copy(createdAt = now)
 
         return request.recipients.map { recipient ->
             giftWrapper.wrap(
-                rumor = rumor.copy(createdAt = createdAt),
+                rumor = rumor,
                 senderPubKey = request.senderPubKey,
                 senderPrivateKeyHex = request.senderPrivateKeyHex,
                 recipient = recipient,
                 expirationSeconds = request.expirationSeconds,
-                createdAt = createdAt,
             )
         }
     }
@@ -157,29 +157,27 @@ class Nip59GiftWrapper(
         senderPrivateKeyHex: String,
         recipient: Nip17Recipient,
         expirationSeconds: Long?,
-        createdAt: Long,
     ): Nip17GiftWrap {
         require(rumor.pubKey == senderPubKey) { "Seal pubkey must match sender." }
-        val sealCreatedAt = timestampRandomizer.randomize(createdAt)
-        val giftCreatedAt = timestampRandomizer.randomize(createdAt)
+        // NIP-59: only seal and gift-wrap timestamps are randomized, rumor keeps actual time
+        val now = Instant.now().epochSecond
+        val sealCreatedAt = timestampRandomizer.randomize(now)
+        val giftCreatedAt = timestampRandomizer.randomize(now)
 
         val sealedContent =
             nip44Encryptor.encrypt(
                 senderPrivateKeyHex = senderPrivateKeyHex,
                 receiverPubKeyHex = recipient.pubKeyHex,
-                plaintext = rumor.copy(createdAt = sealCreatedAt).toJson(),
+                plaintext = rumor.toJson(),  // rumor uses its actual timestamp
             )
 
-        val sealTags = buildList {
-            expirationSeconds?.let { add(listOf("expiration", it.toString())) }
-        }
-
+        // NIP-59: seal tags MUST be empty
         val seal =
             UnsignedNostrEvent(
                 pubKey = senderPubKey,
                 createdAt = sealCreatedAt,
                 kind = KIND_SEAL,
-                tags = sealTags,
+                tags = emptyList(),
                 content = sealedContent,
             )
 

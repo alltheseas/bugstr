@@ -41,33 +41,36 @@ class Nip17CrashSender(
         request: Nip17SendRequest,
         onProgress: BugstrProgressCallback? = null,
     ): Result<Unit> {
-        val payloadSize = request.plaintext.toByteArray(Charsets.UTF_8).size
+        // Build DirectPayload to measure actual wrapped size
+        val directPayload = buildDirectPayload(request.plaintext)
+        val payloadSize = directPayload.toString().toByteArray(Charsets.UTF_8).size
 
         return if (payloadSize <= Transport.DIRECT_SIZE_THRESHOLD) {
-            sendDirect(request)
+            sendDirect(request, directPayload)
         } else {
             sendChunked(request, onProgress)
         }
     }
 
-    private suspend fun sendDirect(request: Nip17SendRequest): Result<Unit> {
-        // Wrap in DirectPayload format
+    /** Build the DirectPayload JSON wrapper for crash data. */
+    private fun buildDirectPayload(plaintext: String): JSONObject {
         val crashJson = try {
-            JSONObject(request.plaintext)
+            JSONObject(plaintext)
         } catch (e: org.json.JSONException) {
-            // Log the exception with context, then fall back to raw string
             android.util.Log.w(TAG, "Plaintext is not valid JSON, wrapping as raw string", e)
-            JSONObject().apply { put("raw", request.plaintext) }
+            JSONObject().apply { put("raw", plaintext) }
         }
 
-        val directPayload = JSONObject().apply {
+        return JSONObject().apply {
             put("v", 1)
             put("crash", crashJson)
         }
+    }
 
+    private suspend fun sendDirect(request: Nip17SendRequest, directPayload: JSONObject): Result<Unit> {
+        // Preserve caller's messageKind (don't override to Chat)
         val directRequest = request.copy(
             plaintext = directPayload.toString(),
-            messageKind = Nip17MessageKind.Chat,
         )
 
         val wraps = payloadBuilder.buildGiftWraps(directRequest.toNip17Request())
@@ -228,14 +231,10 @@ class Nip17CrashSender(
             }
         }
 
-        // Build gift wrap for manifest using kind 10421
-        val manifestRequest = Nip17Request(
-            senderPubKey = request.senderPubKey,
-            senderPrivateKeyHex = request.senderPrivateKeyHex,
-            recipients = request.recipients,
+        // Build gift wrap for manifest - preserve all request fields except plaintext
+        val manifestRequest = request.copy(
             plaintext = manifestJson.toString(),
-            expirationSeconds = request.expirationSeconds,
-        )
+        ).toNip17Request()
 
         val wraps = payloadBuilder.buildGiftWraps(manifestRequest)
         if (wraps.isEmpty()) return Result.success(Unit)

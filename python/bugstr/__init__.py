@@ -453,9 +453,10 @@ def _maybe_send(payload: Payload) -> None:
 
 def _build_gift_wrap(rumor_kind: int, content: str) -> Event:
     """Build a NIP-17 gift-wrapped event for a rumor."""
+    # NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
     rumor = {
         "pubkey": _sender_keys.public_key().to_hex(),
-        "created_at": _random_past_timestamp(),
+        "created_at": int(time.time()),
         "kind": rumor_kind,
         "tags": [["p", _developer_pubkey_hex]],
         "content": content,
@@ -548,14 +549,16 @@ def _publish_to_all_relays(event: Event) -> None:
 
 def _wait_for_rate_limit(relay_url: str) -> None:
     """Wait for relay rate limit if needed."""
+    rate_limit = get_relay_rate_limit(relay_url)
+
+    # Compute sleep duration inside lock to prevent race condition
     with _last_post_time_lock:
         last_time = _last_post_time.get(relay_url, 0)
+        elapsed = time.time() - last_time
+        sleep_duration = rate_limit - elapsed if elapsed < rate_limit else 0
 
-    rate_limit = get_relay_rate_limit(relay_url)
-    elapsed = time.time() - last_time
-
-    if elapsed < rate_limit:
-        time.sleep(rate_limit - elapsed)
+    if sleep_duration > 0:
+        time.sleep(sleep_duration)
 
 
 def _record_post_time(relay_url: str) -> None:
@@ -681,13 +684,26 @@ def _send_to_nostr(payload: Payload) -> None:
             for i, chunk in enumerate(chunks):
                 chunk_event = _build_chunk_event(chunk)
                 chunk_id = chunk_event.id().to_hex()
-                chunk_ids.append(chunk_id)
 
                 # Publish with verification and retry (starts at round-robin relay)
                 success, success_relay = _publish_chunk_with_verify(chunk_event, relays, i % num_relays)
-                if success:
-                    chunk_relays[chunk_id] = [success_relay]
-                # If all relays failed, chunk is lost - receiver will report missing chunk
+                if not success:
+                    # Abort upload - don't publish partial/broken manifest
+                    import logging
+                    logging.error(f"Bugstr: failed to publish chunk {i}/{total_chunks} (id: {chunk_id})")
+                    if _config.on_progress:
+                        _config.on_progress(Progress(
+                            phase="uploading",
+                            current_chunk=i,
+                            total_chunks=total_chunks,
+                            fraction_completed=i / total_chunks * 0.95,
+                            estimated_seconds_remaining=0,
+                            localized_description=f"Failed to upload chunk {i}",
+                        ))
+                    return  # Silent failure - don't crash the app
+
+                chunk_ids.append(chunk_id)
+                chunk_relays[chunk_id] = [success_relay]
 
                 # Report progress
                 if _config.on_progress:

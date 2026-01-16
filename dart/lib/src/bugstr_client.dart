@@ -196,7 +196,8 @@ class Bugstr {
 
   /// Build a NIP-17 gift-wrapped event for a rumor.
   static Nip01Event _buildGiftWrap(int rumorKind, String content) {
-    final rumorCreatedAt = _randomPastTimestamp();
+    // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
+    final rumorCreatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final rumorTags = [
       ['p', _developerPubkeyHex!]
     ];
