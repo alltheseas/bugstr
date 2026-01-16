@@ -2,10 +2,25 @@
 ///
 /// Delivers crash reports via NIP-17 gift-wrapped encrypted DMs
 /// with user consent and auto-expiration.
+///
+/// ## Quick Start
+///
+/// ```dart
+/// import 'package:bugstr/bugstr.dart';
+///
+/// void main() {
+///   Bugstr.init(
+///     developerPubkey: 'npub1...',
+///     environment: 'production',
+///     release: '1.0.0',
+///   );
+///
+///   runApp(MyApp());
+/// }
+/// ```
 library bugstr;
 
-export 'src/bugstr_crash_handler.dart';
-export 'src/bugstr_crash_report_cache.dart';
-export 'src/bugstr_report_assembler.dart';
-export 'src/nip17_payload_builder.dart';
+export 'src/config.dart';
+export 'src/payload.dart';
+export 'src/bugstr_client.dart';
 export 'src/compression.dart';

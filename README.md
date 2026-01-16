@@ -12,7 +12,7 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 |----------|--------|-----------|--------|
 | Android/Kotlin | Production | [`android/`](android/) | ✅ [Zapstore](https://github.com/zapstore/zapstore/pull/272) |
 | TypeScript | Production | [`typescript/`](typescript/) | 🐹 Guinea pigs needed |
-| Flutter/Dart | Skeleton | [`dart/`](dart/) | 🐹 Guinea pigs needed |
+| Flutter/Dart | Library | [`dart/`](dart/) | 🐹 Guinea pigs needed |
 | Rust | CLI + Library | [`rust/`](rust/) | 🐹 Guinea pigs needed |
 | Go | Library | [`go/`](go/) | 🐹 Guinea pigs needed |
 | Python | Library | [`python/`](python/) | 🐹 Guinea pigs needed |

@@ -1,48 +1,127 @@
 # Bugstr for Flutter/Dart
 
-Privacy-focused crash reporting for Flutter/Dart apps using NIP-17 gift-wrapped DMs.
+Zero-infrastructure crash reporting — no server to run, no SaaS to pay for.
 
-> **Status: Skeleton** - This package provides the API structure but is not yet implemented. Contributions welcome!
+## Installation
 
-## Planned Features
+```yaml
+dependencies:
+  bugstr: ^0.1.0
+```
 
-- `BugstrCrashHandler` - Captures uncaught Flutter/Dart exceptions
-- `BugstrCrashReportCache` - Local file-based crash storage with rotation
-- `BugstrReportAssembler` - Formats crash reports with metadata
-- `Nip17PayloadBuilder` - NIP-17/44/59 gift wrap building
-
-## Planned Usage
+## Quick Start
 
 ```dart
 import 'package:bugstr/bugstr.dart';
 
 void main() {
-  BugstrCrashHandler.install(
-    cache: BugstrCrashReportCache(maxReports: 3),
-    assembler: BugstrReportAssembler(
-      appName: 'My App',
-      appVersion: '1.0.0',
-    ),
+  Bugstr.init(
+    developerPubkey: 'npub1...',
+    environment: 'production',
+    release: '1.0.0',
   );
+
   runApp(MyApp());
 }
 ```
 
+## Manual Capture
+
+```dart
+try {
+  riskyOperation();
+} catch (e, stack) {
+  Bugstr.captureException(e, stack);
+}
+```
+
+## Configuration Options
+
+```dart
+Bugstr.init(
+  // Required: Your npub or hex pubkey
+  developerPubkey: 'npub1...',
+
+  // Optional: Custom relays (defaults to damus, primal, nos.lol)
+  relays: ['wss://relay.damus.io', 'wss://relay.primal.net'],
+
+  // Optional: Environment tag
+  environment: 'production',
+
+  // Optional: Release version
+  release: '1.0.0',
+
+  // Optional: Custom redaction patterns
+  redactPatterns: [
+    RegExp(r'api_key=[^&]+'),
+  ],
+
+  // Optional: Modify payload before sending
+  beforeSend: (payload) {
+    // Return null to drop, or modify and return
+    return payload;
+  },
+
+  // Optional: Confirm with user before sending
+  confirmSend: (message, stackPreview) async {
+    return await showConfirmDialog(message);
+  },
+);
+```
+
+## Default Relays
+
+| Relay | Max Size | Notes |
+|-------|----------|-------|
+| `wss://relay.damus.io` | 1 MB | Primary |
+| `wss://relay.primal.net` | 1 MB | Secondary |
+| `wss://nos.lol` | 128 KB | Fallback |
+
+## Compression
+
+Payloads over 1 KB are automatically gzip compressed:
+
+```json
+{
+  "v": 1,
+  "compression": "gzip",
+  "payload": "<base64-encoded-gzip>"
+}
+```
+
+## Privacy Features
+
+- **NIP-17 Gift Wrap**: Crash reports are encrypted with NIP-44 and wrapped per NIP-59
+- **Random Timestamps**: Created_at randomized within ±2 days to prevent timing analysis
+- **Ephemeral Keys**: Each gift wrap uses a fresh random key
+- **Auto-expiration**: Reports expire after 30 days (NIP-40)
+- **Redaction**: Sensitive patterns (tokens, keys, invoices) are auto-redacted
+
+## How It Works
+
+1. **Crash occurs** → Flutter/Dart error handler captures it
+2. **Payload built** → Stack trace redacted and truncated
+3. **User consent** → Optional confirmation dialog
+4. **Gift wrapped** → Encrypted with NIP-44, wrapped per NIP-59
+5. **Published** → Sent to relays as kind 1059 event
+
 ## NIP Compliance
 
-The implementation will follow:
-- **NIP-17** - Private Direct Messages (kind 14 rumors)
-- **NIP-44** - Versioned Encryption (v2)
-- **NIP-59** - Gift Wrap (rumor → seal → gift wrap)
-- **NIP-40** - Expiration Timestamp
-
-**Important**: Rumors must include `id` (computed) and `sig: ""` (empty string) per spec.
-
-## Contributing
-
-See the [monorepo AGENTS.md](../AGENTS.md) for contributor guidelines.
+- **NIP-01**: Event structure and ID computation
+- **NIP-17**: Private Direct Messages (kind 14 rumors)
+- **NIP-44**: Versioned Encryption (v2)
+- **NIP-59**: Gift Wrap (rumor → seal → gift wrap)
+- **NIP-40**: Expiration Timestamp
 
 ## Other Platforms
 
 - [Android/Kotlin](../android/)
 - [TypeScript](../typescript/)
+- [Rust](../rust/)
+- [Go](../go/)
+- [Python](../python/)
+- [React Native](../react-native/)
+
+## License
+
+[MIT](../LICENSE)
