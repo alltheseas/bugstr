@@ -607,8 +607,24 @@ async fn subscribe_relay_with_storage(
 
 /// Fetch chunk events from relays by their event IDs.
 ///
-/// Connects to relays and requests the specified chunk events.
-/// Returns the chunk payloads in order, or an error if chunks are missing.
+/// Connects to relays and requests the specified chunk events (kind 10422).
+/// Tries each relay in order until all chunks are collected.
+///
+/// # Arguments
+///
+/// * `relay_urls` - List of relay WebSocket URLs to query
+/// * `chunk_ids` - Event IDs of chunks to fetch (hex-encoded)
+///
+/// # Returns
+///
+/// Vector of `ChunkPayload` in order by index, ready for reassembly.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Any chunk ID is not valid hex
+/// - Not all chunks could be fetched from any relay
+/// - A chunk is missing at a specific index
 async fn fetch_chunks(
     relay_urls: &[String],
     chunk_ids: &[String],
