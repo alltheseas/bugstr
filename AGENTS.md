@@ -8,9 +8,11 @@ BugStr is a privacy-focused crash reporting library for Nostr applications. It u
 
 ### Supported Platforms
 
-- **Android/Kotlin** - Primary implementation
-- **TypeScript** - [Bugstr-TS](https://github.com/alltheseas/Bugstr-TS)
-- **Flutter/Dart** - Planned
+| Platform | Directory | Status |
+|----------|-----------|--------|
+| Android/Kotlin | `android/` | Production |
+| TypeScript | `typescript/` | Production |
+| Flutter/Dart | `dart/` | Planned |
 
 ### Key NIPs
 
@@ -135,18 +137,24 @@ NIP-17 messages should be tested against multiple clients:
 
 ```
 bugstr/
-├── src/main/java/com/bugstr/     # Core crash handling (Android)
-│   ├── BugstrCrashHandler.kt
-│   ├── BugstrCrashReportCache.kt
-│   ├── BugstrReportAssembler.kt
-│   ├── BugstrAnrWatcher.kt
-│   └── ui/BugstrCrashPrompt.kt
-├── bugstr-nostr-crypto/          # NIP-17/44/59 implementation
-│   └── src/main/kotlin/com/bugstr/nostr/crypto/
-│       ├── Nip17PayloadBuilder.kt
-│       ├── Nip17CrashSender.kt
-│       └── QuartzAdapters.kt
-├── AGENTS.md                     # This file
-├── CHANGELOG.md                  # Version history
-└── README.md                     # User documentation
+├── android/                      # Android/Kotlin implementation
+│   ├── src/main/java/com/bugstr/
+│   │   ├── BugstrCrashHandler.kt
+│   │   ├── BugstrCrashReportCache.kt
+│   │   ├── BugstrReportAssembler.kt
+│   │   ├── BugstrAnrWatcher.kt
+│   │   └── ui/BugstrCrashPrompt.kt
+│   ├── bugstr-nostr-crypto/      # NIP-17/44/59 (Kotlin)
+│   ├── CHANGELOG.md
+│   └── README.md
+├── typescript/                   # TypeScript implementation
+│   ├── src/
+│   ├── CHANGELOG.md
+│   └── README.md
+├── dart/                         # Flutter/Dart (planned)
+├── test-vectors/                 # Shared NIP-17 compliance tests
+│   └── nip17-gift-wrap.json
+├── AGENTS.md                     # This file (shared guidelines)
+├── LICENSE
+└── README.md                     # Monorepo overview
 ```
