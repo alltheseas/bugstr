@@ -6,7 +6,8 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
-    is_crash_report_kind, is_chunked_kind, DirectPayload, ManifestPayload,
+    is_crash_report_kind, is_chunked_kind, DirectPayload, ManifestPayload, ChunkPayload,
+    reassemble_payload, KIND_CHUNK,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -475,15 +476,19 @@ async fn serve(
     // Channel for received crashes
     let (tx, mut rx) = mpsc::channel::<ReceivedCrash>(100);
 
+    // Clone relay list for chunk fetching (need all relays available to each listener)
+    let all_relays: Vec<String> = relays.iter().cloned().collect();
+
     // Spawn relay listeners
     for relay_url in relays {
         let relay = relay_url.clone();
         let keys = keys.clone();
         let tx = tx.clone();
+        let relay_urls = all_relays.clone();
 
         tokio::spawn(async move {
             loop {
-                match subscribe_relay_with_storage(&relay, &keys, &tx).await {
+                match subscribe_relay_with_storage(&relay, &keys, &tx, &relay_urls).await {
                     Ok(()) => {}
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -554,6 +559,7 @@ async fn subscribe_relay_with_storage(
     relay_url: &str,
     keys: &Keys,
     tx: &mpsc::Sender<ReceivedCrash>,
+    all_relay_urls: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut seen: HashSet<EventId> = HashSet::new();
     let (ws_stream, _) = connect_async(relay_url).await?;
@@ -578,7 +584,7 @@ async fn subscribe_relay_with_storage(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Some(crash) = handle_message_for_storage(&text, keys, &mut seen) {
+                if let Some(crash) = handle_message_for_storage(&text, keys, &mut seen, all_relay_urls).await {
                     if tx.send(crash).await.is_err() {
                         break;
                     }
@@ -599,11 +605,154 @@ async fn subscribe_relay_with_storage(
     Ok(())
 }
 
+/// Fetch chunk events from relays by their event IDs.
+///
+/// Connects to relays and requests the specified chunk events.
+/// Returns the chunk payloads in order, or an error if chunks are missing.
+async fn fetch_chunks(
+    relay_urls: &[String],
+    chunk_ids: &[String],
+) -> Result<Vec<ChunkPayload>, Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashMap;
+    use tokio::time::{timeout, Duration};
+
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Parse event IDs
+    let event_ids: Vec<EventId> = chunk_ids
+        .iter()
+        .filter_map(|id| EventId::from_hex(id).ok())
+        .collect();
+
+    if event_ids.len() != chunk_ids.len() {
+        return Err("Invalid chunk event IDs in manifest".into());
+    }
+
+    let mut chunks: HashMap<u32, ChunkPayload> = HashMap::new();
+    let expected_count = chunk_ids.len();
+
+    // Try each relay until we have all chunks
+    for relay_url in relay_urls {
+        if chunks.len() >= expected_count {
+            break;
+        }
+
+        println!("  {} Fetching chunks from {}", "↓".blue(), relay_url);
+
+        let connect_result = timeout(Duration::from_secs(10), connect_async(relay_url)).await;
+        let (ws_stream, _) = match connect_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                eprintln!("    {} Failed to connect: {}", "⚠".yellow(), e);
+                continue;
+            }
+            Err(_) => {
+                eprintln!("    {} Connection timeout", "⚠".yellow());
+                continue;
+            }
+        };
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Build filter for chunk events we still need
+        let missing_ids: Vec<EventId> = event_ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !chunks.contains_key(&(*i as u32)))
+            .map(|(_, id)| *id)
+            .collect();
+
+        if missing_ids.is_empty() {
+            break;
+        }
+
+        let filter = Filter::new()
+            .ids(missing_ids)
+            .kind(Kind::Custom(KIND_CHUNK));
+
+        let subscription_id = "bugstr-chunks";
+        let req = format!(
+            r#"["REQ","{}",{}]"#,
+            subscription_id,
+            serde_json::to_string(&filter)?
+        );
+
+        if write.send(Message::Text(req.into())).await.is_err() {
+            continue;
+        }
+
+        // Read events with timeout
+        let fetch_timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < fetch_timeout && chunks.len() < expected_count {
+            let msg_result = timeout(Duration::from_secs(5), read.next()).await;
+
+            match msg_result {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let msg: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+
+                    if msg.len() >= 3 && msg[0].as_str() == Some("EVENT") {
+                        if let Ok(event) = serde_json::from_value::<Event>(msg[2].clone()) {
+                            // Parse chunk payload
+                            if let Ok(chunk) = ChunkPayload::from_json(&event.content) {
+                                let index = chunk.index;
+                                if !chunks.contains_key(&index) {
+                                    chunks.insert(index, chunk);
+                                    println!("    {} Received chunk {}/{}", "✓".green(), chunks.len(), expected_count);
+                                }
+                            }
+                        }
+                    } else if msg.len() >= 2 && msg[0].as_str() == Some("EOSE") {
+                        // End of stored events
+                        break;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) => break,
+                Ok(Some(Ok(_))) => continue, // Binary, Ping, Pong, Frame
+                Ok(Some(Err(_))) => break,
+                Ok(None) => break,
+                Err(_) => break, // Timeout
+            }
+        }
+
+        // Close subscription
+        let close_msg = format!(r#"["CLOSE","{}"]"#, subscription_id);
+        let _ = write.send(Message::Text(close_msg.into())).await;
+    }
+
+    // Check we got all chunks
+    if chunks.len() != expected_count {
+        return Err(format!(
+            "Missing chunks: got {}, expected {}",
+            chunks.len(),
+            expected_count
+        ).into());
+    }
+
+    // Return chunks in order
+    let mut ordered: Vec<ChunkPayload> = Vec::with_capacity(expected_count);
+    for i in 0..expected_count {
+        match chunks.remove(&(i as u32)) {
+            Some(chunk) => ordered.push(chunk),
+            None => return Err(format!("Missing chunk at index {}", i).into()),
+        }
+    }
+
+    Ok(ordered)
+}
+
 /// Handle incoming message and return crash for storage.
-fn handle_message_for_storage(
+async fn handle_message_for_storage(
     text: &str,
     keys: &Keys,
     seen: &mut HashSet<EventId>,
+    relay_urls: &[String],
 ) -> Option<ReceivedCrash> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
 
@@ -653,10 +802,38 @@ fn handle_message_for_storage(
                     manifest.chunk_count,
                     manifest.total_size
                 );
-                // TODO: Implement chunk fetching from relays
-                // For now, we just log the manifest and skip
-                eprintln!("{} Chunk fetching not yet implemented", "⚠".yellow());
-                return None;
+
+                // Fetch chunks from relays
+                let chunks = match fetch_chunks(relay_urls, &manifest.chunk_ids).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} Failed to fetch chunks: {}", "✗".red(), e);
+                        return None;
+                    }
+                };
+
+                // Reassemble the payload
+                let reassembled = match reassemble_payload(&manifest, &chunks) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("{} Failed to reassemble payload: {}", "✗".red(), e);
+                        return None;
+                    }
+                };
+
+                // Decompress reassembled data
+                let payload_str = String::from_utf8_lossy(&reassembled);
+                let decompressed = decompress_payload(&payload_str)
+                    .unwrap_or_else(|_| payload_str.to_string());
+
+                println!("{} Reassembled {} bytes from {} chunks", "✓".green(), decompressed.len(), chunks.len());
+
+                return Some(ReceivedCrash {
+                    event_id: event.id.to_hex(),
+                    sender_pubkey: rumor.pubkey.clone(),
+                    created_at: rumor.created_at as i64,
+                    content: decompressed,
+                });
             }
             Err(e) => {
                 eprintln!("{} Failed to parse manifest: {}", "✗".red(), e);

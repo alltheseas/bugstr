@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Root hash computed from chunk keys ensures integrity
   - Secure when manifest delivered via NIP-17 gift wrap
 - Receiver now supports kind 10420 in addition to legacy kind 14
-- Receiver detects kind 10421 manifests (chunk fetching pending)
+- Receiver fetches and reassembles chunked crash reports from kind 10421 manifests
 - `DirectPayload`, `ManifestPayload`, `ChunkPayload` types for transport layer
 - `TransportKind` enum for automatic transport selection based on payload size
 - `hashtree-core` dependency for CHK encryption primitives
