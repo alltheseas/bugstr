@@ -1,8 +1,8 @@
 # Bugstr
 
-Privacy-focused crash reporting for Nostr applications.
+Zero-infrastructure crash reporting — no server to run, no SaaS to pay for.
 
-Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) gift-wrapped encrypted direct messages with user consent. Reports auto-expire after 30 days, keeping both sender and receiver in control.
+Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) encrypted direct messages with user consent. Reports auto-expire after 30 days.
 
 <img width="256" height="256" alt="Bugstr logo" src="https://github.com/user-attachments/assets/1c3c17dc-6a6d-4881-9ac7-32217bd4e1ad" />
 
@@ -13,6 +13,7 @@ Bugstr delivers crash reports via [NIP-17](https://github.com/nostr-protocol/nip
 | Android/Kotlin | Production | [`android/`](android/) |
 | TypeScript | Production | [`typescript/`](typescript/) |
 | Flutter/Dart | Skeleton | [`dart/`](dart/) |
+| Rust | CLI + Library | [`rust/`](rust/) |
 
 ## How It Works
 
