@@ -60,5 +60,8 @@ Payload should show `[redacted]` in place of secrets.
 - Browser-first; relies on `nostr-tools` nip44 and `Relay.connect`.
 - Early return/guard clauses used to avoid deep nesting.
 
-## Other Operating Systems
-For Android utilize https://github.com/alltheseas/bugstr
+## Other Platforms
+
+See the [monorepo root](../) for other platform implementations:
+- [Android/Kotlin](../android/)
+- Flutter/Dart (planned)
