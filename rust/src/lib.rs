@@ -23,18 +23,29 @@
 //! }
 //! ```
 
+pub mod chunking;
 pub mod compression;
 pub mod event;
 pub mod storage;
 pub mod symbolication;
+pub mod transport;
 pub mod web;
 
+pub use chunking::{
+    chunk_payload, reassemble_payload, expected_chunk_count, estimate_overhead,
+    ChunkingError, ChunkingResult,
+};
 pub use compression::{compress_payload, decompress_payload, maybe_compress_payload, DEFAULT_THRESHOLD};
 pub use event::UnsignedNostrEvent;
 pub use storage::{CrashReport, CrashGroup, CrashStorage, parse_crash_content};
 pub use symbolication::{
     MappingStore, Platform, Symbolicator, SymbolicatedFrame, SymbolicatedStack,
     SymbolicationContext, SymbolicationError,
+};
+pub use transport::{
+    DirectPayload, ManifestPayload, ChunkPayload, TransportKind,
+    KIND_DIRECT, KIND_MANIFEST, KIND_CHUNK, DIRECT_SIZE_THRESHOLD,
+    is_crash_report_kind, is_chunked_kind,
 };
 pub use web::{create_router, AppState};
 

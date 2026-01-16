@@ -6,6 +6,7 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
+    is_crash_report_kind, is_chunked_kind, DirectPayload, ManifestPayload,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -639,8 +640,51 @@ fn handle_message_for_storage(
         }
     };
 
+    let rumor_kind = rumor.kind as u16;
+
+    // Handle different transport kinds
+    if is_chunked_kind(rumor_kind) {
+        // Kind 10421: Manifest for chunked crash report
+        match ManifestPayload::from_json(&rumor.content) {
+            Ok(manifest) => {
+                println!(
+                    "{} Received manifest: {} chunks, {} bytes total",
+                    "📦".cyan(),
+                    manifest.chunk_count,
+                    manifest.total_size
+                );
+                // TODO: Implement chunk fetching from relays
+                // For now, we just log the manifest and skip
+                eprintln!("{} Chunk fetching not yet implemented", "⚠".yellow());
+                return None;
+            }
+            Err(e) => {
+                eprintln!("{} Failed to parse manifest: {}", "✗".red(), e);
+                return None;
+            }
+        }
+    }
+
     // Decompress if needed
-    let content = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
+    let decompressed = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
+
+    // Extract crash content based on transport kind
+    let content = if is_crash_report_kind(rumor_kind) {
+        // Kind 10420: Direct crash report with DirectPayload wrapper
+        match DirectPayload::from_json(&decompressed) {
+            Ok(direct) => {
+                // Convert JSON value to string for storage
+                serde_json::to_string(&direct.crash).unwrap_or(decompressed)
+            }
+            Err(_) => {
+                // Fall back to treating content as raw crash data
+                decompressed
+            }
+        }
+    } else {
+        // Legacy kind 14 or other: treat content as raw crash data
+        decompressed
+    };
 
     Some(ReceivedCrash {
         event_id: event.id.to_hex(),

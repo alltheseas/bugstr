@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Transport module for crash report delivery with new event kinds:
+  - Kind 10420: Direct crash report transport (≤50KB payloads)
+  - Kind 10421: Hashtree manifest for large crash reports
+  - Kind 10422: CHK-encrypted chunk data
+- CHK (Content Hash Key) chunking module for large payload support:
+  - `chunk_payload()` splits and encrypts payloads using CHK encryption
+  - `reassemble_payload()` decrypts and reconstructs original data
+  - Root hash computed from chunk keys ensures integrity
+  - Secure when manifest delivered via NIP-17 gift wrap
+- Receiver now supports kind 10420 in addition to legacy kind 14
+- Receiver detects kind 10421 manifests (chunk fetching pending)
+- `DirectPayload`, `ManifestPayload`, `ChunkPayload` types for transport layer
+- `TransportKind` enum for automatic transport selection based on payload size
+- `hashtree-core` dependency for CHK encryption primitives
 - Symbolication module with support for 7 platforms:
   - Android (ProGuard/R8 mapping.txt parsing)
   - JavaScript/Electron (source map support)
