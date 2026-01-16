@@ -108,6 +108,22 @@ Some clients (e.g., 0xchat) reject messages missing these fields.
 
 The [`test-vectors/`](test-vectors/) directory contains JSON test cases for NIP-17 compliance. All platform implementations should validate against these vectors.
 
+## Symbolication
+
+Release builds typically use code obfuscation/minification, producing stack traces with mangled names and memory addresses instead of readable function names and line numbers.
+
+**Current status:** Symbolication tooling is not yet implemented. Crash reports contain raw stack traces as captured.
+
+**Planned approach:**
+- Store mapping files (ProGuard, dSYM, sourcemaps) locally or in your CI
+- Use platform-specific tools to symbolicate:
+  - **Android**: `retrace` with ProGuard mapping
+  - **iOS/macOS**: `atos` or `symbolicatecrash` with dSYM
+  - **JavaScript**: Source map support in browser devtools
+  - **Flutter**: `flutter symbolize` with app symbols
+
+Contributions welcome for automated symbolication in the receiver CLI/WebUI.
+
 ## Contributing
 
 See [AGENTS.md](AGENTS.md) for contributor guidelines covering:
