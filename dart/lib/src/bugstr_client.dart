@@ -330,6 +330,63 @@ class Bugstr {
     _recordPostTime(relayUrl);
   }
 
+  /// Verify a chunk event exists on a relay.
+  static Future<bool> _verifyChunkExists(String relayUrl, String eventId) async {
+    try {
+      final ndk = Ndk.defaultConfig();
+      await ndk.relays.connectRelay(relayUrl);
+
+      // Query for the specific event by ID
+      final filter = Filter(
+        ids: [eventId],
+        kinds: [kindChunk],
+        limit: 1,
+      );
+
+      final events = await ndk.requests
+          .query(filters: [filter], relayUrls: [relayUrl])
+          .timeout(const Duration(seconds: 5));
+
+      await ndk.relays.disconnectRelay(relayUrl);
+
+      return events.isNotEmpty;
+    } catch (e) {
+      debugPrint('Bugstr: verify chunk failed on $relayUrl: $e');
+      return false;
+    }
+  }
+
+  /// Publish chunk with verification and retry on failure.
+  /// Returns the relay URL where the chunk was successfully published, or null if all failed.
+  static Future<String?> _publishChunkWithVerify(
+      Nip01Event event, List<String> relays, int startIndex) async {
+    final numRelays = relays.length;
+
+    // Try each relay starting from startIndex (round-robin)
+    for (var attempt = 0; attempt < numRelays; attempt++) {
+      final relayUrl = relays[(startIndex + attempt) % numRelays];
+
+      try {
+        // Publish with rate limiting
+        await _publishChunkToRelay(relayUrl, event);
+
+        // Brief delay before verification
+        await Future.delayed(const Duration(milliseconds: 100));
+
+        // Verify the chunk exists
+        if (await _verifyChunkExists(relayUrl, event.id)) {
+          return relayUrl;
+        }
+        debugPrint('Bugstr: chunk verification failed on $relayUrl, trying next');
+      } catch (e) {
+        debugPrint('Bugstr: chunk publish failed on $relayUrl: $e');
+      }
+      // Try next relay
+    }
+
+    return null; // All relays failed
+  }
+
   /// Estimate total upload time based on chunks and relays.
   static int _estimateUploadSeconds(int totalChunks, int numRelays) {
     // With round-robin, effective rate is numRelays * (1 post / 7.5s)
@@ -373,7 +430,7 @@ class Bugstr {
         final estimatedSeconds = _estimateUploadSeconds(totalChunks, relays.length);
         _onProgress?.call(BugstrProgress.preparing(totalChunks, estimatedSeconds));
 
-        // Build chunk events and track relay assignments
+        // Build chunk events and track relay assignments with verification
         final chunkIds = <String>[];
         final chunkRelays = <String, List<String>>{};
 
@@ -382,25 +439,13 @@ class Bugstr {
           final chunkEvent = _buildChunkEvent(chunk);
           chunkIds.add(chunkEvent.id);
 
-          // Round-robin relay selection
-          final relayUrl = relays[i % relays.length];
-          chunkRelays[chunkEvent.id] = [relayUrl];
-
-          // Publish with rate limiting
-          try {
-            await _publishChunkToRelay(relayUrl, chunkEvent);
-          } catch (e) {
-            debugPrint('Bugstr: Failed to publish chunk $i to $relayUrl: $e');
-            // Try next relay as fallback
-            final fallbackRelay = relays[(i + 1) % relays.length];
-            try {
-              await _publishChunkToRelay(fallbackRelay, chunkEvent);
-              chunkRelays[chunkEvent.id] = [fallbackRelay];
-            } catch (e2) {
-              debugPrint('Bugstr: Fallback also failed: $e2');
-              // Continue anyway, cross-relay aggregation may still find it
-            }
+          // Publish with verification and retry (starts at round-robin relay)
+          final successRelay =
+              await _publishChunkWithVerify(chunkEvent, relays, i % relays.length);
+          if (successRelay != null) {
+            chunkRelays[chunkEvent.id] = [successRelay];
           }
+          // If all relays failed, chunk is lost - receiver will report missing chunk
 
           // Report progress
           final remainingChunks = totalChunks - i - 1;

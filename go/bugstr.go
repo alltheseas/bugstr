@@ -636,6 +636,58 @@ func publishChunkToRelay(ctx context.Context, relayURL string, event nostr.Event
 	return err
 }
 
+// verifyChunkExists queries a relay to verify a chunk event exists.
+func verifyChunkExists(ctx context.Context, relayURL string, eventID string) bool {
+	verifyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	relay, err := nostr.RelayConnect(verifyCtx, relayURL)
+	if err != nil {
+		return false
+	}
+	defer relay.Close()
+
+	filter := nostr.Filter{
+		IDs:   []string{eventID},
+		Kinds: []int{KindChunk},
+		Limit: 1,
+	}
+
+	events, err := relay.QuerySync(verifyCtx, filter)
+	if err != nil {
+		return false
+	}
+
+	return len(events) > 0
+}
+
+// publishChunkWithVerify publishes a chunk and verifies it was stored.
+// Returns the relay URL where the chunk was successfully published, or error.
+func publishChunkWithVerify(ctx context.Context, relays []string, startIndex int, event nostr.Event) (string, error) {
+	numRelays := len(relays)
+
+	// Try each relay starting from startIndex (round-robin)
+	for attempt := 0; attempt < numRelays; attempt++ {
+		relayURL := relays[(startIndex+attempt)%numRelays]
+
+		// Publish with rate limiting
+		if err := publishChunkToRelay(ctx, relayURL, event); err != nil {
+			continue // Try next relay
+		}
+
+		// Brief delay before verification to allow relay to process
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify the chunk exists on the relay
+		if verifyChunkExists(ctx, relayURL, event.ID) {
+			return relayURL, nil
+		}
+		// Verification failed, try next relay
+	}
+
+	return "", fmt.Errorf("failed to publish and verify chunk on any relay")
+}
+
 func sendToNostr(ctx context.Context, payload *Payload) error {
 	relays := config.Relays
 	if len(relays) == 0 {
@@ -685,7 +737,7 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		})
 	}
 
-	// Build and publish chunk events with round-robin distribution
+	// Build and publish chunk events with round-robin distribution and verification
 	chunkIDs := make([]string, totalChunks)
 	chunkRelays := make(map[string][]string)
 
@@ -693,19 +745,13 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 		chunkEvent := buildChunkEvent(chunk)
 		chunkIDs[i] = chunkEvent.ID
 
-		// Round-robin relay selection
-		relayURL := relays[i%numRelays]
-		chunkRelays[chunkEvent.ID] = []string{relayURL}
-
-		// Publish with rate limiting
-		if err := publishChunkToRelay(ctx, relayURL, chunkEvent); err != nil {
-			// Try fallback relay
-			fallbackRelay := relays[(i+1)%numRelays]
-			if err := publishChunkToRelay(ctx, fallbackRelay, chunkEvent); err != nil {
-				// Continue anyway, cross-relay aggregation may still find it
-			} else {
-				chunkRelays[chunkEvent.ID] = []string{fallbackRelay}
-			}
+		// Publish with verification and retry (starts at round-robin relay)
+		successRelay, err := publishChunkWithVerify(ctx, relays, i%numRelays, chunkEvent)
+		if err != nil {
+			// All relays failed - this chunk is lost, but continue with others
+			// Receiver will report missing chunk
+		} else {
+			chunkRelays[chunkEvent.ID] = []string{successRelay}
 		}
 
 		// Report progress

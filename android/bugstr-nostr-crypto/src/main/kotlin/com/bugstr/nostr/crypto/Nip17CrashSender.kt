@@ -100,6 +100,43 @@ class Nip17CrashSender(
         lastPostTime[relayUrl] = System.currentTimeMillis()
     }
 
+    /**
+     * Publish chunk with verification and retry on failure.
+     * @return The relay URL where the chunk was successfully published, or null if all failed.
+     */
+    private suspend fun publishChunkWithVerify(
+        chunk: SignedNostrEvent,
+        relays: List<String>,
+        startIndex: Int,
+    ): String? {
+        val numRelays = relays.size
+
+        // Try each relay starting from startIndex (round-robin)
+        for (attempt in 0 until numRelays) {
+            val relayUrl = relays[(startIndex + attempt) % numRelays]
+
+            // Publish with rate limiting
+            waitForRateLimit(relayUrl)
+            val publishResult = publisher.publishChunkToRelay(chunk, relayUrl)
+            recordPostTime(relayUrl)
+
+            if (publishResult.isFailure) {
+                continue // Try next relay
+            }
+
+            // Brief delay before verification
+            kotlinx.coroutines.delay(100)
+
+            // Verify the chunk exists
+            if (publisher.verifyChunkExists(chunk.id, relayUrl)) {
+                return relayUrl
+            }
+            // Verification failed, try next relay
+        }
+
+        return null // All relays failed
+    }
+
     private suspend fun sendChunked(
         request: Nip17SendRequest,
         onProgress: BugstrProgressCallback?,
@@ -115,7 +152,7 @@ class Nip17CrashSender(
         val estimatedSeconds = Transport.estimateUploadSeconds(totalChunks, relays.size)
         onProgress?.invoke(BugstrProgress.preparing(totalChunks, estimatedSeconds))
 
-        // Build and publish chunk events with round-robin distribution
+        // Build and publish chunk events with round-robin distribution and verification
         val chunkIds = mutableListOf<String>()
         val chunkRelays = mutableMapOf<String, List<String>>()
 
@@ -134,22 +171,12 @@ class Nip17CrashSender(
 
             chunkIds.add(signedChunk.id)
 
-            // Round-robin relay selection
-            val relayUrl = relays[index % relays.size]
-            chunkRelays[signedChunk.id] = listOf(relayUrl)
-
-            // Publish chunk to selected relay with rate limiting
-            waitForRateLimit(relayUrl)
-            val publishResult = publisher.publishChunkToRelay(signedChunk, relayUrl)
-            if (publishResult.isFailure) {
-                // Try fallback relay
-                val fallbackRelay = relays[(index + 1) % relays.size]
-                waitForRateLimit(fallbackRelay)
-                publisher.publishChunkToRelay(signedChunk, fallbackRelay)
-                    .getOrElse { /* Continue anyway, cross-relay aggregation may find it */ }
-                chunkRelays[signedChunk.id] = listOf(fallbackRelay)
+            // Publish with verification and retry (starts at round-robin relay)
+            val successRelay = publishChunkWithVerify(signedChunk, relays, index % relays.size)
+            if (successRelay != null) {
+                chunkRelays[signedChunk.id] = listOf(successRelay)
             }
-            recordPostTime(relayUrl)
+            // If all relays failed, chunk is lost - receiver will report missing chunk
 
             // Report progress
             val remainingChunks = totalChunks - index - 1
@@ -301,6 +328,19 @@ interface NostrEventPublisher {
      * @param relayUrl The relay URL to publish to.
      */
     suspend fun publishChunkToRelay(chunk: SignedNostrEvent, relayUrl: String): Result<Unit>
+
+    /**
+     * Verify a chunk event exists on a relay.
+     * Used for publish verification before moving to the next chunk.
+     *
+     * @param eventId The event ID to check.
+     * @param relayUrl The relay URL to query.
+     * @return True if the event exists on the relay.
+     */
+    suspend fun verifyChunkExists(eventId: String, relayUrl: String): Boolean {
+        // Default implementation: assume success (for backwards compatibility)
+        return true
+    }
 
     /**
      * Publish a chunk event to all relays for redundancy.

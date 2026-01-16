@@ -319,6 +319,57 @@ async function publishChunkToRelay(
 }
 
 /**
+ * Verify a chunk event exists on a relay.
+ */
+async function verifyChunkExists(relayUrl: string, eventId: string): Promise<boolean> {
+  try {
+    const relay = await Relay.connect(relayUrl);
+    const events = await relay.list([{ ids: [eventId], kinds: [KIND_CHUNK], limit: 1 }]);
+    relay.close();
+    return events.length > 0;
+  } catch (err) {
+    console.log(`Bugstr: verify chunk failed on ${relayUrl}: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * Publish chunk with verification and retry on failure.
+ * @returns The relay URL where the chunk was successfully published, or null if all failed.
+ */
+async function publishChunkWithVerify(
+  event: ReturnType<typeof finalizeEvent>,
+  relays: string[],
+  startIndex: number
+): Promise<string | null> {
+  const numRelays = relays.length;
+
+  // Try each relay starting from startIndex (round-robin)
+  for (let attempt = 0; attempt < numRelays; attempt++) {
+    const relayUrl = relays[(startIndex + attempt) % numRelays];
+
+    try {
+      // Publish with rate limiting
+      await publishChunkToRelay(relayUrl, event);
+
+      // Brief delay before verification
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Verify the chunk exists
+      if (await verifyChunkExists(relayUrl, event.id)) {
+        return relayUrl;
+      }
+      console.log(`Bugstr: chunk verification failed on ${relayUrl}, trying next`);
+    } catch (err) {
+      console.log(`Bugstr: chunk publish failed on ${relayUrl}: ${err}`);
+    }
+    // Try next relay
+  }
+
+  return null; // All relays failed
+}
+
+/**
  * Send payload via NIP-17 gift wrap, using chunking for large payloads.
  * Uses round-robin relay distribution to maximize throughput while
  * respecting per-relay rate limits (8 posts/min for strfry+noteguard).
@@ -357,7 +408,7 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
     const estimatedSeconds = estimateUploadSeconds(totalChunks, relays.length);
     config.onProgress?.(progressPreparing(totalChunks, estimatedSeconds));
 
-    // Build chunk events and track relay assignments
+    // Build chunk events and track relay assignments with verification
     const chunkEvents = chunks.map(buildChunkEvent);
     const chunkIds: string[] = [];
     const chunkRelays: Record<string, string[]> = {};
@@ -366,25 +417,12 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
       const chunkEvent = chunkEvents[i];
       chunkIds.push(chunkEvent.id);
 
-      // Round-robin relay selection
-      const relayUrl = relays[i % relays.length];
-      chunkRelays[chunkEvent.id] = [relayUrl];
-
-      // Publish with rate limiting
-      try {
-        await publishChunkToRelay(relayUrl, chunkEvent);
-      } catch (err) {
-        console.log(`Bugstr: Failed to publish chunk ${i} to ${relayUrl}: ${err}`);
-        // Try fallback relay
-        const fallbackRelay = relays[(i + 1) % relays.length];
-        try {
-          await publishChunkToRelay(fallbackRelay, chunkEvent);
-          chunkRelays[chunkEvent.id] = [fallbackRelay];
-        } catch (err2) {
-          console.log(`Bugstr: Fallback also failed: ${err2}`);
-          // Continue anyway, cross-relay aggregation may still find it
-        }
+      // Publish with verification and retry (starts at round-robin relay)
+      const successRelay = await publishChunkWithVerify(chunkEvent, relays, i % relays.length);
+      if (successRelay) {
+        chunkRelays[chunkEvent.id] = [successRelay];
       }
+      // If all relays failed, chunk is lost - receiver will report missing chunk
 
       // Report progress
       const remainingChunks = totalChunks - i - 1;

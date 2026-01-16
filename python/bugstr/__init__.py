@@ -547,6 +547,58 @@ def _publish_chunk_to_relay(event: Event, relay_url: str) -> bool:
         return False
 
 
+def _verify_chunk_exists(event_id: str, relay_url: str) -> bool:
+    """Verify a chunk event exists on a relay."""
+    try:
+        from nostr_sdk import Filter
+        client = Client(Keys.generate())
+        client.add_relay(relay_url)
+        client.connect()
+
+        # Query for the specific event by ID
+        filter = Filter().id(event_id).kind(Kind(KIND_CHUNK)).limit(1)
+        events = client.get_events_of([filter], timeout=5)
+        client.disconnect()
+
+        return len(events) > 0
+    except Exception:
+        return False
+
+
+def _publish_chunk_with_verify(event: Event, relays: list[str], start_index: int) -> tuple[bool, str]:
+    """Publish a chunk with verification and retry on failure.
+
+    Args:
+        event: The chunk event to publish
+        relays: List of relay URLs
+        start_index: Starting relay index (for round-robin)
+
+    Returns:
+        Tuple of (success, relay_url) where relay_url is where the chunk was published
+    """
+    num_relays = len(relays)
+    event_id = event.id().to_hex()
+
+    # Try each relay starting from start_index
+    for attempt in range(num_relays):
+        relay_url = relays[(start_index + attempt) % num_relays]
+
+        # Publish with rate limiting
+        if not _publish_chunk_to_relay(event, relay_url):
+            continue  # Try next relay
+
+        # Brief delay before verification
+        time.sleep(0.1)
+
+        # Verify the chunk exists
+        if _verify_chunk_exists(event_id, relay_url):
+            return True, relay_url
+
+        # Verification failed, try next relay
+
+    return False, ""
+
+
 def _send_to_nostr(payload: Payload) -> None:
     """Send payload via NIP-17 gift wrap, using chunking for large payloads.
 
@@ -586,7 +638,7 @@ def _send_to_nostr(payload: Payload) -> None:
                     localized_description="Preparing crash report...",
                 ))
 
-            # Build and publish chunk events with round-robin distribution
+            # Build and publish chunk events with round-robin distribution and verification
             chunk_ids = []
             chunk_relays = {}
 
@@ -595,17 +647,11 @@ def _send_to_nostr(payload: Payload) -> None:
                 chunk_id = chunk_event.id().to_hex()
                 chunk_ids.append(chunk_id)
 
-                # Round-robin relay selection
-                relay_url = relays[i % num_relays]
-                chunk_relays[chunk_id] = [relay_url]
-
-                # Publish with rate limiting
-                if not _publish_chunk_to_relay(chunk_event, relay_url):
-                    # Try fallback relay
-                    fallback_relay = relays[(i + 1) % num_relays]
-                    if _publish_chunk_to_relay(chunk_event, fallback_relay):
-                        chunk_relays[chunk_id] = [fallback_relay]
-                    # Continue anyway, cross-relay aggregation may still find it
+                # Publish with verification and retry (starts at round-robin relay)
+                success, success_relay = _publish_chunk_with_verify(chunk_event, relays, i % num_relays)
+                if success:
+                    chunk_relays[chunk_id] = [success_relay]
+                # If all relays failed, chunk is lost - receiver will report missing chunk
 
                 # Report progress
                 if _config.on_progress:
