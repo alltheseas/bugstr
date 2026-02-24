@@ -2,6 +2,17 @@
 //!
 //! Stores decrypted crash reports with indexing for efficient querying
 //! and grouping by fingerprint (Rollbar-style: exception_class + filenames + methods).
+//!
+//! # Fingerprint Invariants (do not change without updating test-vectors/)
+//!
+//! - Line numbers MUST be stripped from frame fingerprints
+//!   (see test: test_same_stack_different_line_numbers_same_fingerprint)
+//! - Framework frames MUST be excluded (dart:*, java.lang.*, node:*, etc.)
+//!   (see: is_in_app_frame)
+//! - Fingerprints are versioned with "v1:" prefix. Changing the algorithm
+//!   requires a new version prefix and migration logic.
+//! - Reference vectors: test-vectors/sdk-conformance/fingerprint-vectors.json
+//! - Payload schema: test-vectors/sdk-conformance/crash-payload.schema.json
 
 use regex::Regex;
 use rusqlite::{params, Connection, Result};
@@ -360,6 +371,10 @@ pub fn is_url_only(content: &str) -> bool {
 ///   for each in-app frame: input += normalized_file + ":" + method + "\n"
 ///   if no in-app frames: input += normalize_message(message)
 ///   fingerprint = "v1:" + hex(sha256(input))[..32]
+///
+/// # INVARIANT: Changing this algorithm changes ALL fingerprints.
+/// Update the version prefix (v1 -> v2), add migration logic for existing
+/// databases, and regenerate test-vectors/sdk-conformance/fingerprint-vectors.json.
 pub fn compute_fingerprint(
     exception_type: Option<&str>,
     message: Option<&str>,
@@ -551,6 +566,8 @@ pub fn extract_frame_parts(line: &str) -> Option<(String, String)> {
 }
 
 /// Returns true if a frame is "in-app" (not framework/runtime).
+/// INVARIANT: Adding new exclusions changes fingerprints for affected crashes.
+/// When adding a new framework prefix, verify against fingerprint-vectors.json.
 pub fn is_in_app_frame(file: &str, method: &str) -> bool {
     // Dart runtime
     if file.starts_with("dart:") {
@@ -1044,5 +1061,89 @@ mod tests {
         // Verify URL row marked as not a crash
         let url_row = storage.get_by_id(2).unwrap().unwrap();
         assert!(!url_row.is_crash);
+    }
+
+    /// Validate fingerprint computation against the shared test vectors.
+    /// If this test fails, either the algorithm changed (bump version prefix)
+    /// or the vectors need regenerating.
+    #[test]
+    fn test_conformance_fingerprint_vectors() {
+        let vectors_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-vectors/sdk-conformance/fingerprint-vectors.json"
+        );
+        let content = std::fs::read_to_string(vectors_path)
+            .expect("fingerprint-vectors.json must exist at test-vectors/sdk-conformance/");
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let vectors = json["vectors"].as_array().expect("vectors must be an array");
+        for vector in vectors {
+            let desc = vector["description"].as_str().unwrap();
+            let input = &vector["input"];
+
+            let exc = input["exception_type"].as_str();
+            let msg = input["message"].as_str();
+            let stack = input["stack_trace"].as_str();
+
+            let expected_fp = vector["expected_fingerprint"].as_str().unwrap();
+            let actual_fp = compute_fingerprint(exc, msg, stack);
+
+            assert_eq!(
+                actual_fp, expected_fp,
+                "Fingerprint mismatch for vector '{}': expected {}, got {}",
+                desc, expected_fp, actual_fp
+            );
+        }
+
+        // Also validate the assertions section
+        let assertions = json["assertions"].as_array().expect("assertions must be an array");
+        let vector_map: std::collections::HashMap<&str, &str> = vectors.iter().map(|v| {
+            (v["description"].as_str().unwrap(), v["expected_fingerprint"].as_str().unwrap())
+        }).collect();
+
+        for assertion in assertions {
+            let rule = assertion["rule"].as_str().unwrap();
+            let relation = assertion["relation"].as_str().unwrap();
+            let vector_names: Vec<&str> = assertion["vectors"].as_array().unwrap()
+                .iter().map(|v| v.as_str().unwrap()).collect();
+
+            let fp0 = vector_map[vector_names[0]];
+            let fp1 = vector_map[vector_names[1]];
+
+            match relation {
+                "equal" => assert_eq!(fp0, fp1, "Assertion '{}' failed: {} and {} should be equal", rule, vector_names[0], vector_names[1]),
+                "not_equal" => assert_ne!(fp0, fp1, "Assertion '{}' failed: {} and {} should differ", rule, vector_names[0], vector_names[1]),
+                _ => panic!("Unknown relation: {}", relation),
+            }
+        }
+    }
+
+    /// Validate that all payloads in payload-valid.json parse without error.
+    #[test]
+    fn test_conformance_valid_payloads() {
+        let payloads_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test-vectors/sdk-conformance/payload-valid.json"
+        );
+        let content = std::fs::read_to_string(payloads_path)
+            .expect("payload-valid.json must exist at test-vectors/sdk-conformance/");
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let payloads = json["payloads"].as_array().expect("payloads must be an array");
+        for entry in payloads {
+            let desc = entry["description"].as_str().unwrap();
+            let payload = &entry["payload"];
+
+            // Verify the payload can be serialized and parsed as crash content
+            let payload_str = serde_json::to_string(payload).unwrap();
+            let parsed = parse_crash_content(&payload_str);
+
+            // Valid payloads should always have a message (our schema requires it)
+            assert!(
+                parsed.message.is_some() || parsed.is_crash,
+                "Valid payload '{}' should parse with a message or be recognized as crash",
+                desc
+            );
+        }
     }
 }

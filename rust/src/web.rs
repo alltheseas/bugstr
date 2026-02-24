@@ -1,6 +1,14 @@
 //! Web server for the Bugstr crash report dashboard.
 //!
 //! Provides a REST API and serves an embedded static dashboard.
+//!
+//! # API Contract
+//!
+//! JSON response shapes (GroupJson, CrashJson) are consumed by the frontend
+//! (static/index.html) and potentially external tools. Changing field names
+//! or removing fields is a breaking change.
+//!
+//! Payload schema: test-vectors/sdk-conformance/crash-payload.schema.json
 
 use axum::{
     extract::{Path, State},
