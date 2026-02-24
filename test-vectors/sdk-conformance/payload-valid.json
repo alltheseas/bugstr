@@ -1,0 +1,71 @@
+{
+  "$schema": "./crash-payload.schema.json",
+  "description": "Valid crash report payloads. All SDKs MUST be able to produce payloads matching these structures. The receiver MUST accept and parse all of these.",
+  "payloads": [
+    {
+      "description": "minimal_message_only",
+      "notes": "Minimum valid payload — just a message.",
+      "payload": {
+        "message": "Something went wrong"
+      }
+    },
+    {
+      "description": "full_dart_crash",
+      "notes": "Complete Flutter/Dart crash report with all fields.",
+      "payload": {
+        "message": "Bad state: no element",
+        "stack": "#0      _AboutSection.build (package:zapstore/screens/profile_screen.dart:123:45)\n#1      StatefulElement.build (package:flutter/src/widgets/framework.dart:5765:27)\n#2      ComponentElement.performRebuild (package:flutter/src/widgets/framework.dart:5698:15)\n#3      _rootRun (dart:async/zone.dart:1399:13)",
+        "environment": "production",
+        "release": "1.2.0+42",
+        "app_id": "com.example.zapstore",
+        "platform": "flutter"
+      }
+    },
+    {
+      "description": "full_android_crash",
+      "notes": "Complete Android/Java crash report.",
+      "payload": {
+        "message": "Attempt to invoke virtual method on null reference",
+        "stack": "java.lang.NullPointerException: Attempt to invoke virtual method on null reference\n\tat com.example.myapp.MainActivity.onCreate(MainActivity.java:42)\n\tat android.app.Activity.performCreate(Activity.java:8000)\n\tat android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1309)\n\tat java.lang.Thread.run(Thread.java:929)",
+        "environment": "production",
+        "release": "2.1.0",
+        "app_id": "com.example.myapp",
+        "platform": "android"
+      }
+    },
+    {
+      "description": "full_js_crash",
+      "notes": "Complete JavaScript/Electron crash report.",
+      "payload": {
+        "message": "Cannot read properties of undefined (reading 'map')",
+        "stack": "TypeError: Cannot read properties of undefined (reading 'map')\n    at handleClick (app/components/Button.js:15:3)\n    at HTMLButtonElement.dispatch (vendor.js:1234:5)\n    at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+        "environment": "production",
+        "release": "0.5.0",
+        "app_id": "com.example.desktop",
+        "platform": "electron"
+      }
+    },
+    {
+      "description": "message_with_nulls",
+      "notes": "Message with all optional fields explicitly null.",
+      "payload": {
+        "message": "Unknown error occurred",
+        "stack": null,
+        "environment": null,
+        "release": null,
+        "app_id": null,
+        "platform": null
+      }
+    },
+    {
+      "description": "non_fatal_caught_exception",
+      "notes": "A non-fatal error reported via reportError(). Still valid payload.",
+      "payload": {
+        "message": "Failed to load user profile: 404 Not Found",
+        "stack": "    at fetchProfile (app/services/api.js:42:11)\n    at async loadUser (app/screens/profile.js:15:5)",
+        "environment": "staging",
+        "release": "1.0.0-beta.3"
+      }
+    }
+  ]
+}
