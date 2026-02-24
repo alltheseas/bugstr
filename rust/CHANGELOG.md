@@ -34,9 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /api/symbolicate` web API endpoint for dashboard integration
 - `--mappings` option for `bugstr serve` to enable symbolication
 - `MappingStore` for organizing mapping files by platform/app/version
+- Fingerprint-based crash grouping (Rollbar-style algorithm):
+  - `compute_fingerprint()` — SHA256 of exception type + all in-app file:method pairs, line numbers stripped
+  - `compute_group_title()` — human-readable titles like "StateError in build (profile_screen.dart)"
+  - Dart, Java, and JavaScript stack frame parsing with in-app detection
+  - Message normalization fallback (strips hex, IPs, timestamps, large numbers)
+- Non-crash data filtering: URL-only content (blossom URLs) marked `is_crash = false` and excluded from groups
+- Database migration: automatic `ALTER TABLE` for existing databases, fingerprint backfill at startup
+- `GET /api/groups/:fingerprint` endpoint for drill-down by fingerprint
+- Dashboard groups view shows human-readable titles and sample messages
 
 ### Changed
-- None
+- Crash groups now aggregate by fingerprint instead of exception type only
+- Groups API returns `fingerprint`, `title`, `sample_message` fields
+- Dashboard fetches group drill-down by fingerprint instead of exception type
+- `count()` now returns only actual crash count (excludes non-crash data)
 
 ### Fixed
 - ProGuard/R8 parsing now supports `:origStart:origEnd` line range format
