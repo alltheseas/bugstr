@@ -1,10 +1,13 @@
 //! SQLite storage for crash reports.
 //!
 //! Stores decrypted crash reports with indexing for efficient querying
-//! and grouping by exception type, app version, etc.
+//! and grouping by fingerprint (Rollbar-style: exception_class + filenames + methods).
 
+use regex::Regex;
 use rusqlite::{params, Connection, Result};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// A stored crash report.
 #[derive(Debug, Clone)]
@@ -22,16 +25,22 @@ pub struct CrashReport {
     pub raw_content: String,
     pub environment: Option<String>,
     pub release: Option<String>,
+    pub fingerprint: Option<String>,
+    pub group_title: Option<String>,
+    pub is_crash: bool,
 }
 
-/// A group of crashes by exception type.
+/// A group of crashes by fingerprint.
 #[derive(Debug, Clone)]
 pub struct CrashGroup {
+    pub fingerprint: String,
+    pub title: String,
     pub exception_type: String,
     pub count: i64,
     pub first_seen: i64,
     pub last_seen: i64,
     pub app_versions: Vec<String>,
+    pub sample_message: Option<String>,
 }
 
 /// SQLite-backed crash report storage.
@@ -45,6 +54,7 @@ impl CrashStorage {
         let conn = Connection::open(path)?;
         let storage = Self { conn };
         storage.init_schema()?;
+        storage.migrate()?;
         Ok(storage)
     }
 
@@ -72,15 +82,81 @@ impl CrashStorage {
                 stack_trace TEXT,
                 raw_content TEXT NOT NULL,
                 environment TEXT,
-                release TEXT
+                release TEXT,
+                fingerprint TEXT,
+                group_title TEXT,
+                is_crash INTEGER DEFAULT 1
             );
 
             CREATE INDEX IF NOT EXISTS idx_crashes_received_at ON crashes(received_at DESC);
             CREATE INDEX IF NOT EXISTS idx_crashes_exception_type ON crashes(exception_type);
             CREATE INDEX IF NOT EXISTS idx_crashes_app_version ON crashes(app_version);
             CREATE INDEX IF NOT EXISTS idx_crashes_sender ON crashes(sender_pubkey);
+            CREATE INDEX IF NOT EXISTS idx_crashes_fingerprint ON crashes(fingerprint);
             ",
         )
+    }
+
+    /// Migrate existing databases: add new columns if missing.
+    fn migrate(&self) -> Result<()> {
+        // Each ALTER TABLE will fail silently if column already exists
+        let alters = [
+            "ALTER TABLE crashes ADD COLUMN fingerprint TEXT",
+            "ALTER TABLE crashes ADD COLUMN group_title TEXT",
+            "ALTER TABLE crashes ADD COLUMN is_crash INTEGER DEFAULT 1",
+        ];
+        for sql in &alters {
+            // Ignore "duplicate column" errors
+            let _ = self.conn.execute_batch(sql);
+        }
+        // Ensure fingerprint index exists
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_crashes_fingerprint ON crashes(fingerprint)"
+        );
+        Ok(())
+    }
+
+    /// Backfill fingerprints for rows that have NULL fingerprint.
+    /// Also marks URL-only rows as is_crash = 0.
+    pub fn backfill_fingerprints(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, exception_type, message, stack_trace, raw_content
+             FROM crashes WHERE fingerprint IS NULL"
+        )?;
+
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut count = 0;
+        for (id, exc_type, msg, stack, raw) in &rows {
+            let is_crash = !is_url_only(raw);
+            let fp = compute_fingerprint(
+                exc_type.as_deref(),
+                msg.as_deref(),
+                stack.as_deref(),
+            );
+            let title = compute_group_title(
+                exc_type.as_deref(),
+                stack.as_deref(),
+                msg.as_deref(),
+            );
+            self.conn.execute(
+                "UPDATE crashes SET fingerprint = ?1, group_title = ?2, is_crash = ?3 WHERE id = ?4",
+                params![fp, title, is_crash as i32, id],
+            )?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Inserts a new crash report. Returns the inserted row ID.
@@ -90,8 +166,9 @@ impl CrashStorage {
             "INSERT OR IGNORE INTO crashes (
                 event_id, sender_pubkey, received_at, created_at,
                 app_name, app_version, exception_type, message,
-                stack_trace, raw_content, environment, release
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                stack_trace, raw_content, environment, release,
+                fingerprint, group_title, is_crash
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 report.event_id,
                 report.sender_pubkey,
@@ -105,6 +182,9 @@ impl CrashStorage {
                 report.raw_content,
                 report.environment,
                 report.release,
+                report.fingerprint,
+                report.group_title,
+                report.is_crash as i32,
             ],
         )?;
 
@@ -120,70 +200,100 @@ impl CrashStorage {
         let mut stmt = self.conn.prepare(
             "SELECT id, event_id, sender_pubkey, received_at, created_at,
                     app_name, app_version, exception_type, message,
-                    stack_trace, raw_content, environment, release
+                    stack_trace, raw_content, environment, release,
+                    fingerprint, group_title, is_crash
              FROM crashes
+             WHERE is_crash = 1
              ORDER BY received_at DESC
              LIMIT ?1",
         )?;
 
-        let rows = stmt.query_map([limit], |row| {
-            Ok(CrashReport {
-                id: row.get(0)?,
-                event_id: row.get(1)?,
-                sender_pubkey: row.get(2)?,
-                received_at: row.get(3)?,
-                created_at: row.get(4)?,
-                app_name: row.get(5)?,
-                app_version: row.get(6)?,
-                exception_type: row.get(7)?,
-                message: row.get(8)?,
-                stack_trace: row.get(9)?,
-                raw_content: row.get(10)?,
-                environment: row.get(11)?,
-                release: row.get(12)?,
-            })
-        })?;
-
+        let rows = stmt.query_map([limit], |row| row_to_crash_report(row))?;
         rows.collect()
     }
 
-    /// Gets crash groups aggregated by exception type.
+    /// Gets crash groups aggregated by fingerprint.
     pub fn get_groups(&self, limit: usize) -> Result<Vec<CrashGroup>> {
         let mut stmt = self.conn.prepare(
             "SELECT
+                COALESCE(fingerprint, COALESCE(exception_type, 'unknown')) as fp,
+                COALESCE(group_title, COALESCE(exception_type, 'Unknown')) as title,
                 COALESCE(exception_type, 'Unknown') as exc_type,
                 COUNT(*) as count,
                 MIN(received_at) as first_seen,
                 MAX(received_at) as last_seen,
-                GROUP_CONCAT(DISTINCT app_version) as versions
+                GROUP_CONCAT(DISTINCT app_version) as versions,
+                (SELECT message FROM crashes c2
+                 WHERE COALESCE(c2.fingerprint, COALESCE(c2.exception_type, 'unknown')) = COALESCE(crashes.fingerprint, COALESCE(crashes.exception_type, 'unknown'))
+                   AND c2.is_crash = 1
+                 ORDER BY c2.received_at DESC LIMIT 1) as sample_msg
              FROM crashes
-             GROUP BY exc_type
-             ORDER BY count DESC
+             WHERE is_crash = 1
+             GROUP BY fp
+             ORDER BY last_seen DESC
              LIMIT ?1",
         )?;
 
         let rows = stmt.query_map([limit], |row| {
-            let versions_str: Option<String> = row.get(4)?;
+            let versions_str: Option<String> = row.get(6)?;
             let app_versions = versions_str
-                .map(|s| s.split(',').map(String::from).collect())
+                .map(|s| s.split(',').filter(|v| !v.is_empty()).map(String::from).collect())
                 .unwrap_or_default();
 
             Ok(CrashGroup {
-                exception_type: row.get(0)?,
-                count: row.get(1)?,
-                first_seen: row.get(2)?,
-                last_seen: row.get(3)?,
+                fingerprint: row.get(0)?,
+                title: row.get(1)?,
+                exception_type: row.get(2)?,
+                count: row.get(3)?,
+                first_seen: row.get(4)?,
+                last_seen: row.get(5)?,
                 app_versions,
+                sample_message: row.get(7)?,
             })
         })?;
 
         rows.collect()
     }
 
-    /// Gets total crash count.
+    /// Gets crashes filtered by fingerprint.
+    pub fn get_by_fingerprint(&self, fingerprint: &str, limit: usize) -> Result<Vec<CrashReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_id, sender_pubkey, received_at, created_at,
+                    app_name, app_version, exception_type, message,
+                    stack_trace, raw_content, environment, release,
+                    fingerprint, group_title, is_crash
+             FROM crashes
+             WHERE COALESCE(fingerprint, COALESCE(exception_type, 'unknown')) = ?1
+               AND is_crash = 1
+             ORDER BY received_at DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![fingerprint, limit], |row| row_to_crash_report(row))?;
+        rows.collect()
+    }
+
+    /// Gets crashes filtered by exception type (legacy, kept for compatibility).
+    pub fn get_by_exception_type(&self, exception_type: &str, limit: usize) -> Result<Vec<CrashReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_id, sender_pubkey, received_at, created_at,
+                    app_name, app_version, exception_type, message,
+                    stack_trace, raw_content, environment, release,
+                    fingerprint, group_title, is_crash
+             FROM crashes
+             WHERE COALESCE(exception_type, 'Unknown') = ?1
+             ORDER BY received_at DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![exception_type, limit], |row| row_to_crash_report(row))?;
+        rows.collect()
+    }
+
+    /// Gets total crash count (only actual crashes).
     pub fn count(&self) -> Result<i64> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM crashes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM crashes WHERE is_crash = 1", [], |row| row.get(0))
     }
 
     /// Deletes crashes older than the given timestamp.
@@ -199,36 +309,304 @@ impl CrashStorage {
         let mut stmt = self.conn.prepare(
             "SELECT id, event_id, sender_pubkey, received_at, created_at,
                     app_name, app_version, exception_type, message,
-                    stack_trace, raw_content, environment, release
+                    stack_trace, raw_content, environment, release,
+                    fingerprint, group_title, is_crash
              FROM crashes
              WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query_map([id], |row| {
-            Ok(CrashReport {
-                id: row.get(0)?,
-                event_id: row.get(1)?,
-                sender_pubkey: row.get(2)?,
-                received_at: row.get(3)?,
-                created_at: row.get(4)?,
-                app_name: row.get(5)?,
-                app_version: row.get(6)?,
-                exception_type: row.get(7)?,
-                message: row.get(8)?,
-                stack_trace: row.get(9)?,
-                raw_content: row.get(10)?,
-                environment: row.get(11)?,
-                release: row.get(12)?,
-            })
-        })?;
-
+        let mut rows = stmt.query_map([id], |row| row_to_crash_report(row))?;
         rows.next().transpose()
     }
 }
 
+fn row_to_crash_report(row: &rusqlite::Row) -> rusqlite::Result<CrashReport> {
+    let is_crash_int: i32 = row.get::<_, Option<i32>>(15)?.unwrap_or(1);
+    Ok(CrashReport {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        sender_pubkey: row.get(2)?,
+        received_at: row.get(3)?,
+        created_at: row.get(4)?,
+        app_name: row.get(5)?,
+        app_version: row.get(6)?,
+        exception_type: row.get(7)?,
+        message: row.get(8)?,
+        stack_trace: row.get(9)?,
+        raw_content: row.get(10)?,
+        environment: row.get(11)?,
+        release: row.get(12)?,
+        fingerprint: row.get(13)?,
+        group_title: row.get(14)?,
+        is_crash: is_crash_int != 0,
+    })
+}
+
+// ============================================================================
+// Fingerprint computation (Rollbar-style)
+// ============================================================================
+
+/// Returns true if the content is a bare URL (not a crash report).
+pub fn is_url_only(content: &str) -> bool {
+    let trimmed = content.trim();
+    // Single line starting with http
+    !trimmed.contains('\n') && (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+}
+
+/// Compute a fingerprint for crash grouping.
+///
+/// Algorithm (Rollbar-style):
+///   input = exception_type + "\n"
+///   for each in-app frame: input += normalized_file + ":" + method + "\n"
+///   if no in-app frames: input += normalize_message(message)
+///   fingerprint = "v1:" + hex(sha256(input))[..32]
+pub fn compute_fingerprint(
+    exception_type: Option<&str>,
+    message: Option<&str>,
+    stack_trace: Option<&str>,
+) -> String {
+    let mut input = String::new();
+
+    // Exception type
+    input.push_str(exception_type.unwrap_or("Unknown"));
+    input.push('\n');
+
+    // Extract in-app frames
+    let mut found_frames = false;
+    if let Some(stack) = stack_trace {
+        for line in stack.lines() {
+            if let Some((method, file)) = extract_frame_parts(line) {
+                if is_in_app_frame(&file, &method) {
+                    input.push_str(&file);
+                    input.push(':');
+                    input.push_str(&method);
+                    input.push('\n');
+                    found_frames = true;
+                }
+            }
+        }
+    }
+
+    // Fallback to normalized message if no frames found
+    if !found_frames {
+        if let Some(msg) = message {
+            input.push_str(&normalize_message(msg));
+        }
+    }
+
+    let hash = Sha256::digest(input.as_bytes());
+    let hex = hex::encode(hash);
+    format!("v1:{}", &hex[..32])
+}
+
+/// Compute a human-readable group title.
+///
+/// Format: "ExceptionType in method (file)" or "ExceptionType: first line of message"
+pub fn compute_group_title(
+    exception_type: Option<&str>,
+    stack_trace: Option<&str>,
+    message: Option<&str>,
+) -> String {
+    let exc = exception_type.unwrap_or("Unknown");
+
+    // Try to find the first in-app frame
+    if let Some(stack) = stack_trace {
+        for line in stack.lines() {
+            if let Some((method, file)) = extract_frame_parts(line) {
+                if is_in_app_frame(&file, &method) {
+                    // Shorten method: take last segment if dotted
+                    let short_method = method.rsplit('.').next().unwrap_or(&method);
+                    return format!("{} in {} ({})", exc, short_method, file);
+                }
+            }
+        }
+    }
+
+    // Fall back to message
+    if let Some(msg) = message {
+        let first_line = msg.lines().next().unwrap_or(msg);
+        let truncated: String = first_line.chars().take(80).collect();
+        if truncated.len() < first_line.len() {
+            return format!("{}: {}...", exc, truncated);
+        }
+        return format!("{}: {}", exc, truncated);
+    }
+
+    exc.to_string()
+}
+
+// Compiled regex patterns (OnceLock = compile once)
+
+fn dart_frame_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // #0      ClassName.method (package:app/path/file.dart:123:45)
+        // #0      ClassName.method (package:app/path/file.dart)
+        Regex::new(r"#\d+\s+(\S+)\s+\(package:[\w.]+/(.+?)(?::\d+(?::\d+)?)?\)").unwrap()
+    })
+}
+
+fn dart_frame_alt_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // #0      ClassName.method (dart:async/zone.dart:123:45)
+        Regex::new(r"#\d+\s+(\S+)\s+\((dart:\S+?)(?::\d+(?::\d+)?)?\)").unwrap()
+    })
+}
+
+fn java_frame_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // at com.example.Class.method(File.java:123)
+        Regex::new(r"^\s*at\s+([\w.$]+)\(([^:)]+?)(?::\d+)?\)").unwrap()
+    })
+}
+
+fn js_frame_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // at functionName (file.js:10:20)
+        // at functionName (node:internal/process/task_queues:95:5)
+        // at file.js:10:20
+        Regex::new(r"^\s*at\s+(?:(\S+)\s+\()(.+?)(?::\d+(?::\d+)?)?\)?$").unwrap()
+    })
+}
+
+fn js_frame_bare_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // at file.js:10:20  (no function name, no parens)
+        Regex::new(r"^\s*at\s+([^(]\S+?)(?::\d+(?::\d+)?)?$").unwrap()
+    })
+}
+
+fn hex_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"0x[0-9a-fA-F]+").unwrap())
+}
+
+fn large_number_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b\d{5,}\b").unwrap())
+}
+
+fn ip_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap())
+}
+
+fn timestamp_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}").unwrap()
+    })
+}
+
+/// Parse a single stack frame line, returning (method_name, filename) with line numbers stripped.
+pub fn extract_frame_parts(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    // Dart package frames: #0 ClassName.method (package:app/path/file.dart:123:45)
+    if let Some(caps) = dart_frame_re().captures(line) {
+        let method = caps.get(1)?.as_str().to_string();
+        let file = caps.get(2)?.as_str().to_string();
+        return Some((method, file));
+    }
+
+    // Dart runtime frames: #0 ClassName.method (dart:async/zone.dart:123)
+    if let Some(caps) = dart_frame_alt_re().captures(line) {
+        let method = caps.get(1)?.as_str().to_string();
+        let file = caps.get(2)?.as_str().to_string();
+        return Some((method, file));
+    }
+
+    // Java frames: at com.example.Class.method(File.java:123)
+    if let Some(caps) = java_frame_re().captures(line) {
+        let method = caps.get(1)?.as_str().to_string();
+        let file = caps.get(2)?.as_str().to_string();
+        return Some((method, file));
+    }
+
+    // JS frames with function name: at functionName (file.js:10:20)
+    if let Some(caps) = js_frame_re().captures(line) {
+        let method = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let file = caps.get(2)?.as_str().to_string();
+        if !file.is_empty() {
+            return Some((method, file));
+        }
+    }
+
+    // JS frames without function name: at file.js:10:20
+    if let Some(caps) = js_frame_bare_re().captures(line) {
+        let file = caps.get(1)?.as_str().to_string();
+        if !file.is_empty() {
+            return Some((String::new(), file));
+        }
+    }
+
+    None
+}
+
+/// Returns true if a frame is "in-app" (not framework/runtime).
+pub fn is_in_app_frame(file: &str, method: &str) -> bool {
+    // Dart runtime
+    if file.starts_with("dart:") {
+        return false;
+    }
+    // Flutter framework
+    if file.starts_with("flutter/") || file.starts_with("packages/flutter/") {
+        return false;
+    }
+    // Java/Android framework
+    let framework_prefixes = [
+        "java.lang.", "java.util.", "java.io.",
+        "android.", "androidx.", "dalvik.", "com.android.",
+        "sun.", "kotlin.", "kotlinx.",
+    ];
+    for prefix in &framework_prefixes {
+        if method.starts_with(prefix) {
+            return false;
+        }
+    }
+    // Node internals
+    if file.starts_with("node:") || file.starts_with("internal/") {
+        return false;
+    }
+    // Generic <anonymous> or native
+    if file == "<anonymous>" || file == "native" || file == "Unknown Source" {
+        return false;
+    }
+
+    true
+}
+
+/// Normalize a message by stripping variable data (hex, IPs, timestamps, large numbers).
+pub fn normalize_message(msg: &str) -> String {
+    let s = hex_re().replace_all(msg, "<hex>");
+    let s = ip_re().replace_all(&s, "<ip>");
+    let s = timestamp_re().replace_all(&s, "<timestamp>");
+    let s = large_number_re().replace_all(&s, "<N>");
+    s.to_string()
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
 /// Parses crash content to extract structured fields.
 /// Handles both JSON payloads (TypeScript SDK) and markdown (Android SDK).
 pub fn parse_crash_content(content: &str) -> ParsedCrash {
+    // Check for URL-only content first
+    if is_url_only(content) {
+        return ParsedCrash {
+            is_crash: false,
+            ..Default::default()
+        };
+    }
+
     // Try JSON first
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
         return ParsedCrash {
@@ -242,6 +620,7 @@ pub fn parse_crash_content(content: &str) -> ParsedCrash {
             release: json.get("release").and_then(|v| v.as_str()).map(String::from),
             app_name: None,
             app_version: None,
+            is_crash: true,
         };
     }
 
@@ -275,6 +654,7 @@ pub fn parse_crash_content(content: &str) -> ParsedCrash {
         release: None,
         app_name: lines.first().map(|s| s.to_string()),
         app_version,
+        is_crash: true,
     }
 }
 
@@ -288,6 +668,7 @@ pub struct ParsedCrash {
     pub release: Option<String>,
     pub app_name: Option<String>,
     pub app_version: Option<String>,
+    pub is_crash: bool,
 }
 
 fn extract_exception_type(message: Option<&str>, stack: Option<&str>) -> Option<String> {
@@ -334,25 +715,34 @@ fn extract_exception_name(line: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn make_report(event_id: &str, exc: Option<&str>, msg: Option<&str>, stack: Option<&str>) -> CrashReport {
+        let fingerprint = compute_fingerprint(exc, msg, stack);
+        let group_title = compute_group_title(exc, stack, msg);
+        CrashReport {
+            id: 0,
+            event_id: event_id.to_string(),
+            sender_pubkey: "pubkey".to_string(),
+            received_at: 1000,
+            created_at: 999,
+            app_name: None,
+            app_version: Some("1.0.0".to_string()),
+            exception_type: exc.map(String::from),
+            message: msg.map(String::from),
+            stack_trace: stack.map(String::from),
+            raw_content: "raw".to_string(),
+            environment: None,
+            release: None,
+            fingerprint: Some(fingerprint),
+            group_title: Some(group_title),
+            is_crash: true,
+        }
+    }
+
     #[test]
     fn test_insert_and_query() {
         let storage = CrashStorage::open_in_memory().unwrap();
 
-        let report = CrashReport {
-            id: 0,
-            event_id: "abc123".to_string(),
-            sender_pubkey: "pubkey123".to_string(),
-            received_at: 1000,
-            created_at: 999,
-            app_name: Some("TestApp".to_string()),
-            app_version: Some("1.0.0".to_string()),
-            exception_type: Some("NullPointerException".to_string()),
-            message: Some("Something went wrong".to_string()),
-            stack_trace: Some("at com.example.Test".to_string()),
-            raw_content: "raw".to_string(),
-            environment: None,
-            release: None,
-        };
+        let report = make_report("abc123", Some("NullPointerException"), Some("Something went wrong"), Some("at com.example.Test(Test.java:42)"));
 
         let id = storage.insert(&report).unwrap();
         assert!(id.is_some());
@@ -360,6 +750,7 @@ mod tests {
         let recent = storage.get_recent(10).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].event_id, "abc123");
+        assert!(recent[0].fingerprint.is_some());
     }
 
     #[test]
@@ -380,6 +771,9 @@ mod tests {
             raw_content: "raw".to_string(),
             environment: None,
             release: None,
+            fingerprint: None,
+            group_title: None,
+            is_crash: true,
         };
 
         let id1 = storage.insert(&report).unwrap();
@@ -391,33 +785,146 @@ mod tests {
     }
 
     #[test]
-    fn test_grouping() {
+    fn test_grouping_by_fingerprint() {
         let storage = CrashStorage::open_in_memory().unwrap();
 
-        // Insert multiple crashes with same exception type
+        // Insert multiple crashes with same fingerprint (same stack)
         for i in 0..5 {
-            let report = CrashReport {
-                id: 0,
-                event_id: format!("event_{}", i),
-                sender_pubkey: "pubkey".to_string(),
-                received_at: 1000 + i,
-                created_at: 999,
-                app_name: None,
-                app_version: Some("1.0.0".to_string()),
-                exception_type: Some("NullPointerException".to_string()),
-                message: None,
-                stack_trace: None,
-                raw_content: "raw".to_string(),
-                environment: None,
-                release: None,
-            };
+            let mut report = make_report(
+                &format!("event_{}", i),
+                Some("NullPointerException"),
+                Some("null ref"),
+                Some("at com.example.MyApp.run(MyApp.java:42)"),
+            );
+            report.received_at = 1000 + i;
             storage.insert(&report).unwrap();
         }
 
         let groups = storage.get_groups(10).unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].exception_type, "NullPointerException");
         assert_eq!(groups[0].count, 5);
+        assert!(groups[0].fingerprint.starts_with("v1:"));
+        assert!(groups[0].title.contains("NullPointerException"));
+    }
+
+    #[test]
+    fn test_same_exception_different_stack_different_fingerprints() {
+        let fp1 = compute_fingerprint(
+            Some("Exception"),
+            None,
+            Some("#0      _HomeState.build (package:app/screens/home.dart:42:5)"),
+        );
+        let fp2 = compute_fingerprint(
+            Some("Exception"),
+            None,
+            Some("#0      _ProfileState.build (package:app/screens/profile.dart:18:3)"),
+        );
+        assert_ne!(fp1, fp2, "Different stacks must produce different fingerprints");
+    }
+
+    #[test]
+    fn test_same_stack_different_line_numbers_same_fingerprint() {
+        let fp1 = compute_fingerprint(
+            Some("Exception"),
+            None,
+            Some("#0      _HomeState.build (package:app/screens/home.dart:42:5)"),
+        );
+        let fp2 = compute_fingerprint(
+            Some("Exception"),
+            None,
+            Some("#0      _HomeState.build (package:app/screens/home.dart:99:10)"),
+        );
+        assert_eq!(fp1, fp2, "Same stack with different line numbers must produce same fingerprint");
+    }
+
+    #[test]
+    fn test_url_only_not_crash() {
+        assert!(is_url_only("https://example.com/blossom/abc123"));
+        assert!(is_url_only("  https://example.com/test  "));
+        assert!(!is_url_only("Error: something broke\nat foo.js:10"));
+        assert!(!is_url_only("https://example.com\nsecond line"));
+    }
+
+    #[test]
+    fn test_parse_url_only_content() {
+        let parsed = parse_crash_content("https://cdn.example.com/blossom/abc123");
+        assert!(!parsed.is_crash);
+    }
+
+    #[test]
+    fn test_extract_dart_frame() {
+        let line = "#0      _AboutSection.build (package:zapstore/screens/profile_screen.dart:123:45)";
+        let (method, file) = extract_frame_parts(line).unwrap();
+        assert_eq!(method, "_AboutSection.build");
+        assert_eq!(file, "screens/profile_screen.dart");
+    }
+
+    #[test]
+    fn test_extract_dart_runtime_frame() {
+        let line = "#5      _rootRun (dart:async/zone.dart:1399:13)";
+        let (method, file) = extract_frame_parts(line).unwrap();
+        assert_eq!(method, "_rootRun");
+        assert_eq!(file, "dart:async/zone.dart");
+        assert!(!is_in_app_frame(&file, &method));
+    }
+
+    #[test]
+    fn test_extract_java_frame() {
+        let line = "    at com.example.MyApp.onCreate(MyApp.java:42)";
+        let (method, file) = extract_frame_parts(line).unwrap();
+        assert_eq!(method, "com.example.MyApp.onCreate");
+        assert_eq!(file, "MyApp.java");
+        assert!(is_in_app_frame(&file, &method));
+    }
+
+    #[test]
+    fn test_java_framework_frame_excluded() {
+        let line = "    at java.lang.Thread.run(Thread.java:929)";
+        let (method, file) = extract_frame_parts(line).unwrap();
+        assert!(!is_in_app_frame(&file, &method));
+    }
+
+    #[test]
+    fn test_extract_js_frame() {
+        let line = "    at processTicksAndRejections (node:internal/process/task_queues:95:5)";
+        let (method, file) = extract_frame_parts(line).unwrap();
+        assert_eq!(method, "processTicksAndRejections");
+        assert!(!is_in_app_frame(&file, &method));
+
+        let line2 = "    at handleError (app/utils/error-handler.js:10:5)";
+        let (method2, file2) = extract_frame_parts(line2).unwrap();
+        assert_eq!(method2, "handleError");
+        assert!(is_in_app_frame(&file2, &method2));
+    }
+
+    #[test]
+    fn test_normalize_message() {
+        let msg = "Connection to 192.168.1.1 failed at 2024-01-15T10:30:00 with code 0xDEAD after 100000 retries";
+        let normalized = normalize_message(msg);
+        assert!(normalized.contains("<ip>"));
+        assert!(normalized.contains("<timestamp>"));
+        assert!(normalized.contains("<hex>"));
+        assert!(normalized.contains("<N>"));
+    }
+
+    #[test]
+    fn test_group_title_with_stack() {
+        let title = compute_group_title(
+            Some("StateError"),
+            Some("#0      _AboutSection.build (package:zapstore/screens/profile_screen.dart:42:5)"),
+            Some("Bad state: no element"),
+        );
+        assert_eq!(title, "StateError in build (screens/profile_screen.dart)");
+    }
+
+    #[test]
+    fn test_group_title_no_stack() {
+        let title = compute_group_title(
+            Some("Error"),
+            None,
+            Some("Something went wrong"),
+        );
+        assert_eq!(title, "Error: Something went wrong");
     }
 
     #[test]
@@ -428,6 +935,7 @@ mod tests {
         assert_eq!(parsed.message, Some("Something failed".to_string()));
         assert!(parsed.stack_trace.is_some());
         assert_eq!(parsed.environment, Some("production".to_string()));
+        assert!(parsed.is_crash);
     }
 
     #[test]
@@ -440,5 +948,101 @@ mod tests {
             extract_exception_name("Error: something went wrong"),
             Some("Error".to_string())
         );
+    }
+
+    #[test]
+    fn test_get_by_fingerprint() {
+        let storage = CrashStorage::open_in_memory().unwrap();
+
+        let report1 = make_report(
+            "event_1",
+            Some("Exception"),
+            None,
+            Some("#0      _HomeState.build (package:app/screens/home.dart:42:5)"),
+        );
+        let fp = report1.fingerprint.clone().unwrap();
+        storage.insert(&report1).unwrap();
+
+        // Different stack = different fingerprint
+        let report2 = make_report(
+            "event_2",
+            Some("Exception"),
+            None,
+            Some("#0      _ProfileState.build (package:app/screens/profile.dart:18:3)"),
+        );
+        storage.insert(&report2).unwrap();
+
+        let results = storage.get_by_fingerprint(&fp, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event_id, "event_1");
+    }
+
+    #[test]
+    fn test_non_crash_excluded_from_groups() {
+        let storage = CrashStorage::open_in_memory().unwrap();
+
+        // Insert a real crash
+        let crash = make_report("event_1", Some("Error"), Some("real crash"), None);
+        storage.insert(&crash).unwrap();
+
+        // Insert a non-crash (URL)
+        let url_report = CrashReport {
+            id: 0,
+            event_id: "event_url".to_string(),
+            sender_pubkey: "pubkey".to_string(),
+            received_at: 1000,
+            created_at: 999,
+            app_name: None,
+            app_version: None,
+            exception_type: None,
+            message: None,
+            stack_trace: None,
+            raw_content: "https://cdn.example.com/blossom/abc".to_string(),
+            environment: None,
+            release: None,
+            fingerprint: Some("v1:url".to_string()),
+            group_title: None,
+            is_crash: false,
+        };
+        storage.insert(&url_report).unwrap();
+
+        let groups = storage.get_groups(10).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 1);
+
+        // count() should only count crashes
+        assert_eq!(storage.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_backfill_fingerprints() {
+        let storage = CrashStorage::open_in_memory().unwrap();
+
+        // Insert without fingerprint (simulating old data)
+        storage.conn.execute(
+            "INSERT INTO crashes (event_id, sender_pubkey, received_at, created_at, raw_content, exception_type, message, stack_trace)
+             VALUES ('old_event', 'pk', 1000, 999, 'raw', 'Error', 'old msg', 'at com.example.Test(Test.java:10)')",
+            [],
+        ).unwrap();
+
+        // Insert a URL row without fingerprint
+        storage.conn.execute(
+            "INSERT INTO crashes (event_id, sender_pubkey, received_at, created_at, raw_content)
+             VALUES ('url_event', 'pk', 1000, 999, 'https://example.com/blossom/test')",
+            [],
+        ).unwrap();
+
+        let count = storage.backfill_fingerprints().unwrap();
+        assert_eq!(count, 2);
+
+        // Verify fingerprint was set
+        let crash = storage.get_by_id(1).unwrap().unwrap();
+        assert!(crash.fingerprint.is_some());
+        assert!(crash.fingerprint.unwrap().starts_with("v1:"));
+        assert!(crash.is_crash);
+
+        // Verify URL row marked as not a crash
+        let url_row = storage.get_by_id(2).unwrap().unwrap();
+        assert!(!url_row.is_crash);
     }
 }

@@ -37,7 +37,10 @@ pub use chunking::{
 };
 pub use compression::{compress_payload, decompress_payload, maybe_compress_payload, DEFAULT_THRESHOLD};
 pub use event::UnsignedNostrEvent;
-pub use storage::{CrashReport, CrashGroup, CrashStorage, parse_crash_content};
+pub use storage::{
+    CrashReport, CrashGroup, CrashStorage, parse_crash_content,
+    compute_fingerprint, compute_group_title, is_url_only,
+};
 pub use symbolication::{
     MappingStore, Platform, Symbolicator, SymbolicatedFrame, SymbolicatedStack,
     SymbolicationContext, SymbolicationError,

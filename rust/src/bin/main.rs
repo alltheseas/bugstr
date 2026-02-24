@@ -8,6 +8,7 @@ use bugstr::{
     MappingStore, Platform, Symbolicator, SymbolicationContext,
     is_crash_report_kind, is_chunked_kind, DirectPayload, ManifestPayload, ChunkPayload,
     reassemble_payload, KIND_CHUNK,
+    compute_fingerprint, compute_group_title, is_url_only,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -500,12 +501,35 @@ async fn serve(
         });
     }
 
+    // Backfill fingerprints for any existing rows that lack them
+    {
+        let storage = state.storage.lock().await;
+        match storage.backfill_fingerprints() {
+            Ok(0) => {}
+            Ok(n) => println!("{} Backfilled fingerprints for {} existing rows", "✓".green(), n),
+            Err(e) => eprintln!("{} Fingerprint backfill failed: {}", "error".red(), e),
+        }
+    }
+
     // Spawn crash storage worker
     let storage_state = state.clone();
     tokio::spawn(async move {
         while let Some(crash) = rx.recv().await {
             let parsed = parse_crash_content(&crash.content);
             let now = Utc::now().timestamp();
+
+            let is_crash = parsed.is_crash && !is_url_only(&crash.content);
+
+            let fingerprint = compute_fingerprint(
+                parsed.exception_type.as_deref(),
+                parsed.message.as_deref(),
+                parsed.stack_trace.as_deref(),
+            );
+            let group_title = compute_group_title(
+                parsed.exception_type.as_deref(),
+                parsed.stack_trace.as_deref(),
+                parsed.message.as_deref(),
+            );
 
             let report = CrashReport {
                 id: 0, // Will be set by insert
@@ -521,17 +545,22 @@ async fn serve(
                 raw_content: crash.content,
                 environment: parsed.environment,
                 release: parsed.release,
+                fingerprint: Some(fingerprint),
+                group_title: Some(group_title),
+                is_crash,
             };
 
             let storage = storage_state.storage.lock().await;
             match storage.insert(&report) {
                 Ok(Some(_id)) => {
-                    println!(
-                        "{} Stored crash: {} - {}",
-                        "✓".green(),
-                        report.exception_type.as_deref().unwrap_or("Unknown"),
-                        report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
-                    );
+                    if is_crash {
+                        println!(
+                            "{} Stored crash: {} - {}",
+                            "✓".green(),
+                            report.exception_type.as_deref().unwrap_or("Unknown"),
+                            report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
+                        );
+                    }
                 }
                 Ok(None) => {
                     // Duplicate, ignore
