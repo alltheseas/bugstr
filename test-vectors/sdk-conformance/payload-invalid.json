@@ -1,0 +1,58 @@
+{
+  "$schema": "./crash-payload.schema.json",
+  "description": "Invalid crash report payloads. SDKs MUST NOT produce these. The receiver SHOULD handle them gracefully (log warning, skip) rather than crash.",
+  "payloads": [
+    {
+      "description": "missing_message",
+      "notes": "message is required. A payload without it is invalid.",
+      "payload": {
+        "stack": "at foo.js:10"
+      },
+      "violation": "missing required field: message"
+    },
+    {
+      "description": "empty_message",
+      "notes": "message must have at least 1 character.",
+      "payload": {
+        "message": ""
+      },
+      "violation": "message minLength is 1"
+    },
+    {
+      "description": "invalid_environment",
+      "notes": "environment must be one of the allowed enum values.",
+      "payload": {
+        "message": "Error",
+        "environment": "prod"
+      },
+      "violation": "environment not in enum [production, staging, development, test, null]"
+    },
+    {
+      "description": "invalid_platform",
+      "notes": "platform must be one of the allowed enum values.",
+      "payload": {
+        "message": "Error",
+        "platform": "ios"
+      },
+      "violation": "platform not in enum [android, flutter, electron, javascript, rust, go, python, react-native, null]"
+    },
+    {
+      "description": "extra_fields",
+      "notes": "additionalProperties is false. Unknown fields are not allowed.",
+      "payload": {
+        "message": "Error",
+        "user_email": "user@example.com",
+        "device_id": "abc123"
+      },
+      "violation": "additionalProperties: user_email, device_id not allowed (also a PII violation)"
+    },
+    {
+      "description": "message_is_number",
+      "notes": "message must be a string, not a number.",
+      "payload": {
+        "message": 42
+      },
+      "violation": "message type must be string"
+    }
+  ]
+}

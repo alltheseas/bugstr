@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bugstr.dev/schemas/crash-payload.schema.json",
+  "title": "BugStr Crash Report Payload",
+  "description": "Schema for crash report payloads sent by BugStr SDKs. All SDKs MUST produce payloads conforming to this schema.",
+  "type": "object",
+  "required": ["message"],
+  "properties": {
+    "message": {
+      "type": "string",
+      "description": "The exception message or error description. MUST NOT be empty.",
+      "minLength": 1
+    },
+    "stack": {
+      "type": ["string", "null"],
+      "description": "Full stack trace as a single string with newlines. Use the platform's native format (Java 'at' frames, Dart '#N' frames, JS 'at' frames). Do NOT strip or truncate — the receiver handles grouping."
+    },
+    "environment": {
+      "type": ["string", "null"],
+      "description": "Deployment environment.",
+      "enum": ["production", "staging", "development", "test", null]
+    },
+    "release": {
+      "type": ["string", "null"],
+      "description": "Application version string (e.g., '1.0.0+42', '2.3.1-beta'). Used for symbolication lookup and release health tracking."
+    },
+    "app_id": {
+      "type": ["string", "null"],
+      "description": "Application identifier (e.g., 'com.example.myapp', 'org.example.app'). Used for symbolication mapping file lookup."
+    },
+    "platform": {
+      "type": ["string", "null"],
+      "description": "Platform identifier. Used to select the correct symbolicator.",
+      "enum": ["android", "flutter", "electron", "javascript", "rust", "go", "python", "react-native", null]
+    }
+  },
+  "additionalProperties": false
+}
