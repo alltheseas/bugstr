@@ -6,7 +6,7 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
-    compute_fingerprint, compute_group_title, is_url_only,
+    compute_fingerprint, compute_group_title,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use nostr::nips::nip44;
 use nostr::prelude::*;
 use sha2::Digest;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +25,61 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol"];
 const DEFAULT_DB_PATH: &str = "bugstr.db";
+const BACKOFF_INITIAL_SECS: u64 = 5;
+const BACKOFF_MAX_SECS: u64 = 300;
+const DEDUP_CAPACITY: usize = 10_000;
+
+/// Bounded dedup set with FIFO eviction.
+/// SQLite `event_id UNIQUE` is the authoritative dedup; this is a fast-path filter.
+struct BoundedDedup {
+    set: HashSet<EventId>,
+    order: VecDeque<EventId>,
+    capacity: usize,
+}
+
+impl BoundedDedup {
+    fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if the id was already present.
+    fn contains(&self, id: &EventId) -> bool {
+        self.set.contains(id)
+    }
+
+    /// Inserts an id. Returns `true` if it was new, `false` if already present.
+    fn insert(&mut self, id: EventId) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.set.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.set.insert(id);
+        self.order.push_back(id);
+        true
+    }
+}
+
+/// Compute backoff duration with 0-25% jitter (no `rand` dependency).
+fn backoff_with_jitter(attempt: u32) -> std::time::Duration {
+    let base = BACKOFF_INITIAL_SECS.saturating_mul(1u64 << attempt.min(63));
+    let capped = base.min(BACKOFF_MAX_SECS);
+    // Jitter: 0-25% using subsecond nanos as cheap entropy
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter_frac = (nanos % 250) as f64 / 1000.0; // 0.0 .. 0.25
+    let jittered = capped as f64 * (1.0 + jitter_frac);
+    std::time::Duration::from_secs_f64(jittered)
+}
 
 #[derive(Parser)]
 #[command(name = "bugstr")]
@@ -128,6 +183,15 @@ struct ReceivedCrash {
     sender_pubkey: String,
     created_at: i64,
     content: String,
+}
+
+/// Events received from relays: either a successfully decrypted crash or a failure.
+enum ReceivedEvent {
+    Crash(ReceivedCrash),
+    Failed {
+        event_id: String,
+        error_reason: String,
+    },
 }
 
 #[tokio::main]
@@ -473,8 +537,8 @@ async fn serve(
     println!("{}", "━".repeat(60).dimmed());
     println!();
 
-    // Channel for received crashes
-    let (tx, mut rx) = mpsc::channel::<ReceivedCrash>(100);
+    // Channel for received events (crashes and failures)
+    let (tx, mut rx) = mpsc::channel::<ReceivedEvent>(100);
 
     // Spawn relay listeners
     for relay_url in relays {
@@ -483,15 +547,28 @@ async fn serve(
         let tx = tx.clone();
 
         tokio::spawn(async move {
+            let mut attempt: u32 = 0;
             loop {
-                match subscribe_relay_with_storage(&relay, &keys, &tx).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        eprintln!("{} Relay {} error: {} - reconnecting...", "error".red(), relay, err_msg);
+                let backoff = {
+                    match subscribe_relay_with_storage(&relay, &keys, &tx).await {
+                        Ok(()) => {
+                            attempt = 0;
+                            None
+                        }
+                        Err(e) => {
+                            let b = backoff_with_jitter(attempt);
+                            eprintln!(
+                                "{} Relay {} error: {} - reconnecting in {:.0}s...",
+                                "error".red(), relay, e, b.as_secs_f64()
+                            );
+                            attempt = attempt.saturating_add(1);
+                            Some(b)
+                        }
                     }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                };
+                // `e` is dropped here; sleep with computed backoff or short delay for graceful close
+                let delay = backoff.unwrap_or(std::time::Duration::from_secs(1));
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -506,62 +583,72 @@ async fn serve(
         }
     }
 
-    // Spawn crash storage worker
+    // Spawn event storage worker
     let storage_state = state.clone();
     tokio::spawn(async move {
-        while let Some(crash) = rx.recv().await {
-            let parsed = parse_crash_content(&crash.content);
+        while let Some(event) = rx.recv().await {
             let now = Utc::now().timestamp();
-
-            let is_crash = parsed.is_crash && !is_url_only(&crash.content);
-
-            let fingerprint = compute_fingerprint(
-                parsed.exception_type.as_deref(),
-                parsed.message.as_deref(),
-                parsed.stack_trace.as_deref(),
-            );
-            let group_title = compute_group_title(
-                parsed.exception_type.as_deref(),
-                parsed.stack_trace.as_deref(),
-                parsed.message.as_deref(),
-            );
-
-            let report = CrashReport {
-                id: 0, // Will be set by insert
-                event_id: crash.event_id.clone(),
-                sender_pubkey: crash.sender_pubkey,
-                received_at: now,
-                created_at: crash.created_at,
-                app_name: parsed.app_name,
-                app_version: parsed.app_version,
-                exception_type: parsed.exception_type,
-                message: parsed.message,
-                stack_trace: parsed.stack_trace,
-                raw_content: crash.content,
-                environment: parsed.environment,
-                release: parsed.release,
-                fingerprint: Some(fingerprint),
-                group_title: Some(group_title),
-                is_crash,
-            };
-
             let storage = storage_state.storage.lock().await;
-            match storage.insert(&report) {
-                Ok(Some(_id)) => {
-                    if is_crash {
-                        println!(
-                            "{} Stored crash: {} - {}",
-                            "✓".green(),
-                            report.exception_type.as_deref().unwrap_or("Unknown"),
-                            report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
-                        );
+
+            match event {
+                ReceivedEvent::Failed { event_id, error_reason } => {
+                    if let Err(e) = storage.insert_failed_event(&event_id, None, &error_reason, now) {
+                        eprintln!("{} Failed to store failed event: {}", "error".red(), e);
                     }
                 }
-                Ok(None) => {
-                    // Duplicate, ignore
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to store crash: {}", "error".red(), e);
+                ReceivedEvent::Crash(crash) => {
+                    let parsed = parse_crash_content(&crash.content);
+
+                    let is_crash = parsed.is_crash;
+
+                    let fingerprint = compute_fingerprint(
+                        parsed.exception_type.as_deref(),
+                        parsed.message.as_deref(),
+                        parsed.stack_trace.as_deref(),
+                    );
+                    let group_title = compute_group_title(
+                        parsed.exception_type.as_deref(),
+                        parsed.stack_trace.as_deref(),
+                        parsed.message.as_deref(),
+                    );
+
+                    let report = CrashReport {
+                        id: 0,
+                        event_id: crash.event_id.clone(),
+                        sender_pubkey: crash.sender_pubkey,
+                        received_at: now,
+                        created_at: crash.created_at,
+                        app_name: parsed.app_name,
+                        app_version: parsed.app_version,
+                        exception_type: parsed.exception_type,
+                        message: parsed.message,
+                        stack_trace: parsed.stack_trace,
+                        raw_content: crash.content,
+                        environment: parsed.environment,
+                        release: parsed.release,
+                        fingerprint: Some(fingerprint),
+                        group_title: Some(group_title),
+                        is_crash,
+                    };
+
+                    match storage.insert(&report) {
+                        Ok(Some(_id)) => {
+                            if is_crash {
+                                println!(
+                                    "{} Stored crash: {} - {}",
+                                    "✓".green(),
+                                    report.exception_type.as_deref().unwrap_or("Unknown"),
+                                    report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // Duplicate, ignore
+                        }
+                        Err(e) => {
+                            eprintln!("{} Failed to store crash: {}", "error".red(), e);
+                        }
+                    }
                 }
             }
         }
@@ -582,9 +669,9 @@ async fn serve(
 async fn subscribe_relay_with_storage(
     relay_url: &str,
     keys: &Keys,
-    tx: &mpsc::Sender<ReceivedCrash>,
+    tx: &mpsc::Sender<ReceivedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
     let (ws_stream, _) = connect_async(relay_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -628,12 +715,12 @@ async fn subscribe_relay_with_storage(
     Ok(())
 }
 
-/// Handle incoming message and return crash for storage.
+/// Handle incoming message and return event for storage.
 fn handle_message_for_storage(
     text: &str,
     keys: &Keys,
-    seen: &mut HashSet<EventId>,
-) -> Option<ReceivedCrash> {
+    seen: &mut BoundedDedup,
+) -> Option<ReceivedEvent> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
 
     if msg.len() < 3 {
@@ -665,19 +752,22 @@ fn handle_message_for_storage(
         Ok(r) => r,
         Err(e) => {
             eprintln!("{} Failed to unwrap gift wrap {}: {}", "✗".red(), &event.id.to_hex()[..16], e);
-            return None;
+            return Some(ReceivedEvent::Failed {
+                event_id: event.id.to_hex(),
+                error_reason: e.to_string(),
+            });
         }
     };
 
     // Decompress if needed
     let content = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
 
-    Some(ReceivedCrash {
+    Some(ReceivedEvent::Crash(ReceivedCrash {
         event_id: event.id.to_hex(),
         sender_pubkey: rumor.pubkey.clone(),
         created_at: rumor.created_at as i64,
         content,
-    })
+    }))
 }
 
 // ============================================================================
@@ -701,7 +791,7 @@ async fn listen(
     println!("  Relays: {}", relays.join(", "));
     println!();
 
-    // Connect to all relays concurrently
+    // Connect to all relays concurrently with reconnection
     let mut handles = vec![];
     for relay_url in relays {
         let relay = relay_url.clone();
@@ -709,8 +799,27 @@ async fn listen(
         let format = format.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = subscribe_relay(&relay, &keys, &format).await {
-                eprintln!("{} Relay {} error: {}", "error".red(), relay, e);
+            let mut attempt: u32 = 0;
+            loop {
+                let backoff = {
+                    match subscribe_relay(&relay, &keys, &format).await {
+                        Ok(()) => {
+                            attempt = 0;
+                            None
+                        }
+                        Err(e) => {
+                            let b = backoff_with_jitter(attempt);
+                            eprintln!(
+                                "{} Relay {} error: {} - reconnecting in {:.0}s...",
+                                "error".red(), relay, e, b.as_secs_f64()
+                            );
+                            attempt = attempt.saturating_add(1);
+                            Some(b)
+                        }
+                    }
+                };
+                let delay = backoff.unwrap_or(std::time::Duration::from_secs(1));
+                tokio::time::sleep(delay).await;
             }
         });
         handles.push(handle);
@@ -729,7 +838,7 @@ async fn subscribe_relay(
     keys: &Keys,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
     let (ws_stream, _) = connect_async(relay_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -780,7 +889,7 @@ fn handle_message(
     text: &str,
     keys: &Keys,
     format: &OutputFormat,
-    seen: &mut HashSet<EventId>,
+    seen: &mut BoundedDedup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text)?;
 
@@ -1119,5 +1228,52 @@ mod tests {
         let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
         let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
         assert!(err.contains("ID mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_bounded_dedup_basic() {
+        let mut dedup = BoundedDedup::new(3);
+        let id1 = EventId::from_hex(&"a".repeat(64)).unwrap();
+        let id2 = EventId::from_hex(&"b".repeat(64)).unwrap();
+
+        assert!(dedup.insert(id1), "first insert should be new");
+        assert!(!dedup.insert(id1), "duplicate insert should return false");
+        assert!(dedup.contains(&id1));
+        assert!(!dedup.contains(&id2));
+        assert!(dedup.insert(id2), "second id should be new");
+    }
+
+    #[test]
+    fn test_bounded_dedup_eviction() {
+        let mut dedup = BoundedDedup::new(2);
+        let id1 = EventId::from_hex(&"a".repeat(64)).unwrap();
+        let id2 = EventId::from_hex(&"b".repeat(64)).unwrap();
+        let id3 = EventId::from_hex(&"c".repeat(64)).unwrap();
+
+        dedup.insert(id1);
+        dedup.insert(id2);
+        // At capacity — inserting id3 should evict id1
+        dedup.insert(id3);
+
+        assert!(!dedup.contains(&id1), "oldest entry should be evicted");
+        assert!(dedup.contains(&id2));
+        assert!(dedup.contains(&id3));
+    }
+
+    #[test]
+    fn test_backoff_with_jitter() {
+        let d0 = backoff_with_jitter(0);
+        assert!(d0.as_secs() >= BACKOFF_INITIAL_SECS);
+        assert!(d0.as_secs() <= BACKOFF_INITIAL_SECS + 2); // 25% of 5 ≈ 1.25
+
+        let d5 = backoff_with_jitter(5);
+        // 5 * 2^5 = 160, capped at 300; with 25% jitter: 160..200
+        assert!(d5.as_secs() >= 160);
+        assert!(d5.as_secs() <= 200);
+
+        let d10 = backoff_with_jitter(10);
+        // Should be capped at 300 + jitter
+        assert!(d10.as_secs() >= BACKOFF_MAX_SECS);
+        assert!(d10.as_secs() <= BACKOFF_MAX_SECS + BACKOFF_MAX_SECS / 4 + 1);
     }
 }

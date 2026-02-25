@@ -104,6 +104,14 @@ impl CrashStorage {
             CREATE INDEX IF NOT EXISTS idx_crashes_app_version ON crashes(app_version);
             CREATE INDEX IF NOT EXISTS idx_crashes_sender ON crashes(sender_pubkey);
             CREATE INDEX IF NOT EXISTS idx_crashes_fingerprint ON crashes(fingerprint);
+
+            CREATE TABLE IF NOT EXISTS failed_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                relay_url TEXT,
+                error_reason TEXT NOT NULL,
+                received_at INTEGER NOT NULL
+            );
             ",
         )
     }
@@ -328,6 +336,31 @@ impl CrashStorage {
 
         let mut rows = stmt.query_map([id], |row| row_to_crash_report(row))?;
         rows.next().transpose()
+    }
+
+    /// Inserts a failed event record (no encrypted content stored for privacy).
+    pub fn insert_failed_event(
+        &self,
+        event_id: &str,
+        relay_url: Option<&str>,
+        error_reason: &str,
+        received_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO failed_events (event_id, relay_url, error_reason, received_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, relay_url, error_reason, received_at],
+        )?;
+        Ok(())
+    }
+
+    /// Gets the total count of failed events.
+    pub fn failed_event_count(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM failed_events",
+            [],
+            |row| row.get(0),
+        )
     }
 }
 
@@ -1235,6 +1268,22 @@ mod tests {
         let fp6 = compute_fingerprint(None, None, None);
         assert_eq!(fp6, "v1:c80c3db2b2cb606bacf75bac6c2e4b92",
             "Fingerprint for empty input changed — algorithm broken");
+    }
+
+    #[test]
+    fn test_insert_and_count_failed_events() {
+        let storage = CrashStorage::open_in_memory().unwrap();
+
+        assert_eq!(storage.failed_event_count().unwrap(), 0);
+
+        storage
+            .insert_failed_event("event_1", Some("wss://relay.example.com"), "decrypt failed", 1000)
+            .unwrap();
+        storage
+            .insert_failed_event("event_2", None, "invalid seal kind", 1001)
+            .unwrap();
+
+        assert_eq!(storage.failed_event_count().unwrap(), 2);
     }
 
     /// Validate that all payloads in payload-valid.json parse without error.

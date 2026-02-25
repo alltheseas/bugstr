@@ -39,6 +39,12 @@ pub enum CompressionError {
 
     #[error("UTF-8 decode failed: {0}")]
     Utf8Failed(#[from] std::string::FromUtf8Error),
+
+    #[error("Unsupported envelope version: expected {expected}, got {got}")]
+    UnsupportedVersion { expected: u8, got: u8 },
+
+    #[error("Unsupported compression type: expected \"{expected}\", got \"{got}\"")]
+    UnsupportedCompression { expected: String, got: String },
 }
 
 /// Compresses a plaintext string using gzip and wraps it in a versioned envelope.
@@ -93,6 +99,19 @@ pub fn decompress_payload(envelope: &str) -> Result<String, CompressionError> {
         Ok(env) => env,
         Err(_) => return Ok(envelope.to_string()), // not a valid envelope
     };
+
+    if parsed.v != COMPRESSION_VERSION {
+        return Err(CompressionError::UnsupportedVersion {
+            expected: COMPRESSION_VERSION,
+            got: parsed.v,
+        });
+    }
+    if parsed.compression != COMPRESSION_TYPE {
+        return Err(CompressionError::UnsupportedCompression {
+            expected: COMPRESSION_TYPE.to_string(),
+            got: parsed.compression,
+        });
+    }
 
     let compressed = BASE64.decode(&parsed.payload)?;
     let mut decoder = GzDecoder::new(&compressed[..]);
@@ -188,6 +207,38 @@ mod tests {
 
         assert!(result.contains("\"compression\":\"gzip\""));
         assert_eq!(decompress_payload(&result).unwrap(), large);
+    }
+
+    #[test]
+    fn decompress_rejects_unsupported_version() {
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "v": 99,
+            "compression": "gzip",
+            "payload": BASE64.encode(b"dummy"),
+        }))
+        .unwrap();
+        let err = decompress_payload(&envelope).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported envelope version"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn decompress_rejects_unsupported_compression() {
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "v": 1,
+            "compression": "zstd",
+            "payload": BASE64.encode(b"dummy"),
+        }))
+        .unwrap();
+        let err = decompress_payload(&envelope).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported compression type"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]

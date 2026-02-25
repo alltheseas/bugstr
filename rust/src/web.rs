@@ -110,10 +110,19 @@ async fn get_group_crashes(
 /// GET /api/stats - Get dashboard statistics
 async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let storage = state.storage.lock().await;
-    match storage.count() {
-        Ok(total) => Json(StatsJson { total_crashes: total }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    let total = match storage.count() {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let failed = storage.failed_event_count().unwrap_or_else(|e| {
+        eprintln!("failed_event_count query failed: {}", e);
+        0
+    });
+    Json(StatsJson {
+        total_crashes: total,
+        failed_events: failed,
+    })
+    .into_response()
 }
 
 /// POST /api/symbolicate - Symbolicate a stack trace
@@ -272,6 +281,7 @@ impl From<CrashGroup> for GroupJson {
 #[derive(serde::Serialize)]
 struct StatsJson {
     total_crashes: i64,
+    failed_events: i64,
 }
 
 // Symbolication request/response types
