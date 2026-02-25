@@ -300,10 +300,11 @@ func sendToNostr(ctx context.Context, payload *Payload) error {
 	senderPubkey, _ := nostr.GetPublicKey(senderPrivkey)
 
 	// Build unsigned kind 14 rumor
+	// NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
 	rumor := map[string]interface{}{
 		"id":         "", // Computed later
 		"pubkey":     senderPubkey,
-		"created_at": randomPastTimestamp(),
+		"created_at": time.Now().Unix(),
 		"kind":       14,
 		"tags":       [][]string{{"p", developerPubkeyHex}},
 		"content":    content,

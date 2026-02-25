@@ -6,6 +6,7 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
+    compute_fingerprint, compute_group_title, is_url_only,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -14,6 +15,7 @@ use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use nostr::nips::nip44;
 use nostr::prelude::*;
+use sha2::Digest;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -494,12 +496,35 @@ async fn serve(
         });
     }
 
+    // Backfill fingerprints for any existing rows that lack them
+    {
+        let storage = state.storage.lock().await;
+        match storage.backfill_fingerprints() {
+            Ok(0) => {}
+            Ok(n) => println!("{} Backfilled fingerprints for {} existing rows", "✓".green(), n),
+            Err(e) => eprintln!("{} Fingerprint backfill failed: {}", "error".red(), e),
+        }
+    }
+
     // Spawn crash storage worker
     let storage_state = state.clone();
     tokio::spawn(async move {
         while let Some(crash) = rx.recv().await {
             let parsed = parse_crash_content(&crash.content);
             let now = Utc::now().timestamp();
+
+            let is_crash = parsed.is_crash && !is_url_only(&crash.content);
+
+            let fingerprint = compute_fingerprint(
+                parsed.exception_type.as_deref(),
+                parsed.message.as_deref(),
+                parsed.stack_trace.as_deref(),
+            );
+            let group_title = compute_group_title(
+                parsed.exception_type.as_deref(),
+                parsed.stack_trace.as_deref(),
+                parsed.message.as_deref(),
+            );
 
             let report = CrashReport {
                 id: 0, // Will be set by insert
@@ -515,17 +540,22 @@ async fn serve(
                 raw_content: crash.content,
                 environment: parsed.environment,
                 release: parsed.release,
+                fingerprint: Some(fingerprint),
+                group_title: Some(group_title),
+                is_crash,
             };
 
             let storage = storage_state.storage.lock().await;
             match storage.insert(&report) {
                 Ok(Some(_id)) => {
-                    println!(
-                        "{} Stored crash: {} - {}",
-                        "✓".green(),
-                        report.exception_type.as_deref().unwrap_or("Unknown"),
-                        report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
-                    );
+                    if is_crash {
+                        println!(
+                            "{} Stored crash: {} - {}",
+                            "✓".green(),
+                            report.exception_type.as_deref().unwrap_or("Unknown"),
+                            report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
+                        );
+                    }
                 }
                 Ok(None) => {
                     // Duplicate, ignore
@@ -794,18 +824,73 @@ struct Rumor {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<Vec<String>>,
-    #[serde(default)]
-    pub sig: String, // Empty for rumors
+    pub sig: Option<String>, // Must be present and empty for rumors (NIP-59)
 }
 
 fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<Rumor, Box<dyn std::error::Error>> {
+    // Verify gift wrap signature (NIP-59: gift wrap is signed by random keypair)
+    gift_wrap.verify()?;
+
     // Decrypt gift wrap to get seal
     let seal_json = nip44::decrypt(keys.secret_key(), &gift_wrap.pubkey, &gift_wrap.content)?;
     let seal: Event = serde_json::from_str(&seal_json)?;
 
+    // Verify seal kind (NIP-59: seal MUST be kind 13)
+    if seal.kind != Kind::Seal {
+        return Err(format!("Invalid seal kind: expected 13, got {}", seal.kind.as_u16()).into());
+    }
+
+    // Verify seal tags are empty (NIP-59: seal tags MUST be empty)
+    if !seal.tags.is_empty() {
+        return Err("Invalid seal: tags must be empty".into());
+    }
+
+    // Verify seal signature (NIP-59: seal is signed by sender)
+    seal.verify()?;
+
     // Decrypt seal to get rumor (unsigned, so parse as Rumor not Event)
     let rumor_json = nip44::decrypt(keys.secret_key(), &seal.pubkey, &seal.content)?;
     let rumor: Rumor = serde_json::from_str(&rumor_json)?;
+
+    // Verify rumor sig is present and empty (NIP-59: rumors are unsigned)
+    match &rumor.sig {
+        Some(s) if s.is_empty() => {} // valid: sig explicitly set to ""
+        Some(s) => return Err(format!("Invalid rumor: sig must be empty, got {} chars", s.len()).into()),
+        None => return Err("Invalid rumor: sig field must be present (as empty string)".into()),
+    }
+
+    // Verify rumor kind is 14 (NIP-17: private direct message)
+    if rumor.kind != 14 {
+        return Err(format!("Invalid rumor kind: expected 14, got {}", rumor.kind).into());
+    }
+
+    // Verify rumor ID matches computed hash (NIP-01: prevents tampering)
+    let serialized = serde_json::to_string(&serde_json::json!([
+        0,
+        rumor.pubkey,
+        rumor.created_at,
+        rumor.kind,
+        rumor.tags,
+        rumor.content,
+    ]))?;
+    let expected_id = hex::encode(sha2::Sha256::digest(serialized.as_bytes()));
+    if rumor.id != expected_id {
+        return Err(format!(
+            "Rumor ID mismatch: claimed {} != computed {}",
+            rumor.id.get(..16).unwrap_or(&rumor.id),
+            expected_id.get(..16).unwrap_or(&expected_id)
+        ).into());
+    }
+
+    // Verify seal.pubkey matches rumor.pubkey (NIP-17: prevent sender spoofing)
+    if seal.pubkey.to_hex() != rumor.pubkey {
+        let seal_hex = seal.pubkey.to_hex();
+        return Err(format!(
+            "Sender spoofing detected: seal.pubkey ({}) != rumor.pubkey ({})",
+            seal_hex.get(..16).unwrap_or(&seal_hex),
+            rumor.pubkey.get(..16).unwrap_or(&rumor.pubkey)
+        ).into());
+    }
 
     Ok(rumor)
 }
@@ -860,4 +945,179 @@ fn print_pretty(rumor: &Rumor, gift_wrap: &Event) {
     }
 
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::nips::nip44;
+    use nostr::prelude::{Keys, Kind, EventBuilder, Tag};
+    use sha2::Digest;
+
+    /// Wrap a raw rumor JSON in seal + gift wrap, returning the gift wrap Event.
+    fn build_gift_wrap(
+        rumor_json: &str,
+        seal_signer: &Keys,
+        receiver: &Keys,
+    ) -> Event {
+        let wrapper_keys = Keys::generate();
+        let seal_content = nip44::encrypt(
+            seal_signer.secret_key(), &receiver.public_key(), rumor_json, nip44::Version::V2,
+        ).unwrap();
+        let seal = EventBuilder::new(Kind::Seal, &seal_content)
+            .sign_with_keys(seal_signer).unwrap();
+        let seal_json = serde_json::to_string(&seal).unwrap();
+        let gw_content = nip44::encrypt(
+            wrapper_keys.secret_key(), &receiver.public_key(), &seal_json, nip44::Version::V2,
+        ).unwrap();
+        EventBuilder::new(Kind::GiftWrap, &gw_content)
+            .tag(Tag::public_key(receiver.public_key()))
+            .sign_with_keys(&wrapper_keys).unwrap()
+    }
+
+    /// Compute rumor ID per NIP-01: SHA-256 of [0, pubkey, created_at, kind, tags, content].
+    fn compute_rumor_id(pubkey: &str, created_at: u64, kind: u64,
+                        tags: &serde_json::Value, content: &str) -> String {
+        let serialized = serde_json::to_string(
+            &serde_json::json!([0, pubkey, created_at, kind, tags, content])
+        ).unwrap();
+        hex::encode(sha2::Sha256::digest(serialized.as_bytes()))
+    }
+
+    /// Full round-trip: construct gift wrap → unwrap → verify all fields.
+    #[test]
+    fn test_gift_wrap_round_trip() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let content = r##"{"message":"test crash","stack":"#0 Foo.bar (package:app/main.dart:10:3)"}"##;
+        let tags_val = serde_json::json!([["p", receiver.public_key().to_hex()]]);
+        let id = compute_rumor_id(
+            &sender.public_key().to_hex(), 1700000000, 14, &tags_val, content,
+        );
+
+        let rumor = Rumor {
+            id: id.clone(),
+            pubkey: sender.public_key().to_hex(),
+            created_at: 1700000000,
+            kind: 14,
+            content: content.to_string(),
+            tags: vec![vec!["p".to_string(), receiver.public_key().to_hex()]],
+            sig: Some(String::new()),
+        };
+        let rumor_json = serde_json::to_string(&rumor).unwrap();
+
+        let gift_wrap = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let result = unwrap_gift_wrap(&receiver, &gift_wrap);
+        assert!(result.is_ok(), "unwrap failed: {:?}", result.err());
+
+        let unwrapped = result.unwrap();
+        assert_eq!(unwrapped.id, id);
+        assert_eq!(unwrapped.pubkey, sender.public_key().to_hex());
+        assert_eq!(unwrapped.kind, 14);
+        assert_eq!(unwrapped.content, content);
+        assert_eq!(unwrapped.created_at, 1700000000);
+        assert_eq!(unwrapped.sig, Some(String::new()));
+    }
+
+    /// Missing sig field → rejected (NIP-59 requires sig present as "").
+    #[test]
+    fn test_gift_wrap_rejects_missing_sig() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "0".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]],
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("sig field must be present"), "got: {err}");
+    }
+
+    /// Non-empty sig → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_nonempty_sig() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "0".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]],
+            "sig": "deadbeef",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("sig must be empty"), "got: {err}");
+    }
+
+    /// Wrong rumor kind (not 14) → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_wrong_rumor_kind() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let tags_val = serde_json::json!([]);
+        let id = compute_rumor_id(&sender.public_key().to_hex(), 1700000000, 1, &tags_val, "test");
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 1, "content": "test",
+            "tags": [], "sig": "",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("expected 14"), "got: {err}");
+    }
+
+    /// seal.pubkey != rumor.pubkey → rejected (anti-spoofing).
+    #[test]
+    fn test_gift_wrap_rejects_sender_spoofing() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+        let impersonator = Keys::generate();
+
+        let tags_val = serde_json::json!([["p", receiver.public_key().to_hex()]]);
+        let id = compute_rumor_id(
+            &sender.public_key().to_hex(), 1700000000, 14, &tags_val, "spoofed",
+        );
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "spoofed",
+            "tags": [["p", receiver.public_key().to_hex()]], "sig": "",
+        })).unwrap();
+
+        // Seal signed by impersonator, not sender
+        let gw = build_gift_wrap(&rumor_json, &impersonator, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("spoofing"), "got: {err}");
+    }
+
+    /// Tampered rumor ID → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_tampered_id() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "a".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]], "sig": "",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("ID mismatch"), "got: {err}");
+    }
 }

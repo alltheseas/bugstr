@@ -151,6 +151,25 @@ class Nip59GiftWrapper(
     private val randomSource: RandomSource = RandomSource(),
     private val timestampRandomizer: TimestampRandomizer = TimestampRandomizer(),
 ) {
+    /**
+     * Wrap a rumor into a sealed, gift-wrapped NIP-59 event.
+     *
+     * Encrypts [rumor] with NIP-44, wraps in a kind-13 seal signed by the sender,
+     * then wraps again in a kind-1059 gift wrap signed by an ephemeral key.
+     *
+     * @param rumor The unsigned kind-14 rumor event to wrap. Its [UnsignedNostrEvent.pubKey]
+     *   must match [senderPubKey].
+     * @param senderPubKey Hex public key of the sender (must match rumor.pubKey).
+     * @param senderPrivateKeyHex Hex private key of the sender, used to sign the seal.
+     * @param recipient The intended recipient (public key + optional relay hint).
+     * @param expirationSeconds Optional NIP-40 expiration timestamp (seconds since epoch).
+     *   Added as an "expiration" tag on the gift wrap if non-null.
+     * @param createdAt Base timestamp (seconds since epoch) for the seal and gift wrap.
+     *   Randomized via [TimestampRandomizer] for metadata protection.
+     * @return A [Nip17GiftWrap] containing the signed gift-wrap event and the ephemeral
+     *   wrapper public key.
+     * @throws IllegalArgumentException if [rumor].pubKey does not match [senderPubKey].
+     */
     fun wrap(
         rumor: UnsignedNostrEvent,
         senderPubKey: String,
@@ -163,23 +182,21 @@ class Nip59GiftWrapper(
         val sealCreatedAt = timestampRandomizer.randomize(createdAt)
         val giftCreatedAt = timestampRandomizer.randomize(createdAt)
 
+        // NIP-59: seal encrypts the rumor as-is (rumor keeps its own timestamp)
         val sealedContent =
             nip44Encryptor.encrypt(
                 senderPrivateKeyHex = senderPrivateKeyHex,
                 receiverPubKeyHex = recipient.pubKeyHex,
-                plaintext = rumor.copy(createdAt = sealCreatedAt).toJson(),
+                plaintext = rumor.toJson(),
             )
 
-        val sealTags = buildList {
-            expirationSeconds?.let { add(listOf("expiration", it.toString())) }
-        }
-
+        // NIP-59: seal tags must be empty (expiration only on gift wrap)
         val seal =
             UnsignedNostrEvent(
                 pubKey = senderPubKey,
                 createdAt = sealCreatedAt,
                 kind = KIND_SEAL,
-                tags = sealTags,
+                tags = emptyList(),
                 content = sealedContent,
             )
 
