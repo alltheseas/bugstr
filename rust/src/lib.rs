@@ -31,7 +31,11 @@ pub mod web;
 
 pub use compression::{compress_payload, decompress_payload, maybe_compress_payload, DEFAULT_THRESHOLD};
 pub use event::UnsignedNostrEvent;
-pub use storage::{CrashReport, CrashGroup, CrashStorage, parse_crash_content};
+pub use storage::{
+    CrashReport, CrashGroup, CrashStorage, parse_crash_content,
+    compute_fingerprint, compute_group_title, is_url_only,
+    extract_frame_parts, is_in_app_frame, normalize_message,
+};
 pub use symbolication::{
     MappingStore, Platform, Symbolicator, SymbolicatedFrame, SymbolicatedStack,
     SymbolicationContext, SymbolicationError,

@@ -25,3 +25,11 @@ node_modules/
 # Test vectors
 test-vectors/node_modules/
 test-vectors/package-lock.json
+
+# Fuzz (generated, not tracked)
+rust/fuzz/corpus/
+rust/fuzz/artifacts/
+rust/fuzz/target/
+
+# Beads (local issue tracking)
+.beads/

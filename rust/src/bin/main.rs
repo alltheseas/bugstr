@@ -6,6 +6,7 @@
 use bugstr::{
     decompress_payload, parse_crash_content, AppState, CrashReport, CrashStorage, create_router,
     MappingStore, Platform, Symbolicator, SymbolicationContext,
+    compute_fingerprint, compute_group_title,
 };
 use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
@@ -14,7 +15,8 @@ use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use nostr::nips::nip44;
 use nostr::prelude::*;
-use std::collections::HashSet;
+use sha2::Digest;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +25,61 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol"];
 const DEFAULT_DB_PATH: &str = "bugstr.db";
+const BACKOFF_INITIAL_SECS: u64 = 5;
+const BACKOFF_MAX_SECS: u64 = 300;
+const DEDUP_CAPACITY: usize = 10_000;
+
+/// Bounded dedup set with FIFO eviction.
+/// SQLite `event_id UNIQUE` is the authoritative dedup; this is a fast-path filter.
+struct BoundedDedup {
+    set: HashSet<EventId>,
+    order: VecDeque<EventId>,
+    capacity: usize,
+}
+
+impl BoundedDedup {
+    fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if the id was already present.
+    fn contains(&self, id: &EventId) -> bool {
+        self.set.contains(id)
+    }
+
+    /// Inserts an id. Returns `true` if it was new, `false` if already present.
+    fn insert(&mut self, id: EventId) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.set.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.set.insert(id);
+        self.order.push_back(id);
+        true
+    }
+}
+
+/// Compute backoff duration with 0-25% jitter (no `rand` dependency).
+fn backoff_with_jitter(attempt: u32) -> std::time::Duration {
+    let base = BACKOFF_INITIAL_SECS.saturating_mul(1u64 << attempt.min(63));
+    let capped = base.min(BACKOFF_MAX_SECS);
+    // Jitter: 0-25% using subsecond nanos as cheap entropy
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter_frac = (nanos % 250) as f64 / 1000.0; // 0.0 .. 0.25
+    let jittered = capped as f64 * (1.0 + jitter_frac);
+    std::time::Duration::from_secs_f64(jittered)
+}
 
 #[derive(Parser)]
 #[command(name = "bugstr")]
@@ -126,6 +183,15 @@ struct ReceivedCrash {
     sender_pubkey: String,
     created_at: i64,
     content: String,
+}
+
+/// Events received from relays: either a successfully decrypted crash or a failure.
+enum ReceivedEvent {
+    Crash(ReceivedCrash),
+    Failed {
+        event_id: String,
+        error_reason: String,
+    },
 }
 
 #[tokio::main]
@@ -471,8 +537,8 @@ async fn serve(
     println!("{}", "━".repeat(60).dimmed());
     println!();
 
-    // Channel for received crashes
-    let (tx, mut rx) = mpsc::channel::<ReceivedCrash>(100);
+    // Channel for received events (crashes and failures)
+    let (tx, mut rx) = mpsc::channel::<ReceivedEvent>(100);
 
     // Spawn relay listeners
     for relay_url in relays {
@@ -481,57 +547,108 @@ async fn serve(
         let tx = tx.clone();
 
         tokio::spawn(async move {
+            let mut attempt: u32 = 0;
             loop {
-                match subscribe_relay_with_storage(&relay, &keys, &tx).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        eprintln!("{} Relay {} error: {} - reconnecting...", "error".red(), relay, err_msg);
+                let backoff = {
+                    match subscribe_relay_with_storage(&relay, &keys, &tx).await {
+                        Ok(()) => {
+                            attempt = 0;
+                            None
+                        }
+                        Err(e) => {
+                            let b = backoff_with_jitter(attempt);
+                            eprintln!(
+                                "{} Relay {} error: {} - reconnecting in {:.0}s...",
+                                "error".red(), relay, e, b.as_secs_f64()
+                            );
+                            attempt = attempt.saturating_add(1);
+                            Some(b)
+                        }
                     }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                };
+                // `e` is dropped here; sleep with computed backoff or short delay for graceful close
+                let delay = backoff.unwrap_or(std::time::Duration::from_secs(1));
+                tokio::time::sleep(delay).await;
             }
         });
     }
 
-    // Spawn crash storage worker
+    // Backfill fingerprints for any existing rows that lack them
+    {
+        let storage = state.storage.lock().await;
+        match storage.backfill_fingerprints() {
+            Ok(0) => {}
+            Ok(n) => println!("{} Backfilled fingerprints for {} existing rows", "✓".green(), n),
+            Err(e) => eprintln!("{} Fingerprint backfill failed: {}", "error".red(), e),
+        }
+    }
+
+    // Spawn event storage worker
     let storage_state = state.clone();
     tokio::spawn(async move {
-        while let Some(crash) = rx.recv().await {
-            let parsed = parse_crash_content(&crash.content);
+        while let Some(event) = rx.recv().await {
             let now = Utc::now().timestamp();
-
-            let report = CrashReport {
-                id: 0, // Will be set by insert
-                event_id: crash.event_id.clone(),
-                sender_pubkey: crash.sender_pubkey,
-                received_at: now,
-                created_at: crash.created_at,
-                app_name: parsed.app_name,
-                app_version: parsed.app_version,
-                exception_type: parsed.exception_type,
-                message: parsed.message,
-                stack_trace: parsed.stack_trace,
-                raw_content: crash.content,
-                environment: parsed.environment,
-                release: parsed.release,
-            };
-
             let storage = storage_state.storage.lock().await;
-            match storage.insert(&report) {
-                Ok(Some(_id)) => {
-                    println!(
-                        "{} Stored crash: {} - {}",
-                        "✓".green(),
-                        report.exception_type.as_deref().unwrap_or("Unknown"),
-                        report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
+
+            match event {
+                ReceivedEvent::Failed { event_id, error_reason } => {
+                    if let Err(e) = storage.insert_failed_event(&event_id, None, &error_reason, now) {
+                        eprintln!("{} Failed to store failed event: {}", "error".red(), e);
+                    }
+                }
+                ReceivedEvent::Crash(crash) => {
+                    let parsed = parse_crash_content(&crash.content);
+
+                    let is_crash = parsed.is_crash;
+
+                    let fingerprint = compute_fingerprint(
+                        parsed.exception_type.as_deref(),
+                        parsed.message.as_deref(),
+                        parsed.stack_trace.as_deref(),
                     );
-                }
-                Ok(None) => {
-                    // Duplicate, ignore
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to store crash: {}", "error".red(), e);
+                    let group_title = compute_group_title(
+                        parsed.exception_type.as_deref(),
+                        parsed.stack_trace.as_deref(),
+                        parsed.message.as_deref(),
+                    );
+
+                    let report = CrashReport {
+                        id: 0,
+                        event_id: crash.event_id.clone(),
+                        sender_pubkey: crash.sender_pubkey,
+                        received_at: now,
+                        created_at: crash.created_at,
+                        app_name: parsed.app_name,
+                        app_version: parsed.app_version,
+                        exception_type: parsed.exception_type,
+                        message: parsed.message,
+                        stack_trace: parsed.stack_trace,
+                        raw_content: crash.content,
+                        environment: parsed.environment,
+                        release: parsed.release,
+                        fingerprint: Some(fingerprint),
+                        group_title: Some(group_title),
+                        is_crash,
+                    };
+
+                    match storage.insert(&report) {
+                        Ok(Some(_id)) => {
+                            if is_crash {
+                                println!(
+                                    "{} Stored crash: {} - {}",
+                                    "✓".green(),
+                                    report.exception_type.as_deref().unwrap_or("Unknown"),
+                                    report.message.as_deref().unwrap_or("No message").chars().take(50).collect::<String>()
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // Duplicate, ignore
+                        }
+                        Err(e) => {
+                            eprintln!("{} Failed to store crash: {}", "error".red(), e);
+                        }
+                    }
                 }
             }
         }
@@ -552,9 +669,9 @@ async fn serve(
 async fn subscribe_relay_with_storage(
     relay_url: &str,
     keys: &Keys,
-    tx: &mpsc::Sender<ReceivedCrash>,
+    tx: &mpsc::Sender<ReceivedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
     let (ws_stream, _) = connect_async(relay_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -598,12 +715,12 @@ async fn subscribe_relay_with_storage(
     Ok(())
 }
 
-/// Handle incoming message and return crash for storage.
+/// Handle incoming message and return event for storage.
 fn handle_message_for_storage(
     text: &str,
     keys: &Keys,
-    seen: &mut HashSet<EventId>,
-) -> Option<ReceivedCrash> {
+    seen: &mut BoundedDedup,
+) -> Option<ReceivedEvent> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
 
     if msg.len() < 3 {
@@ -635,19 +752,22 @@ fn handle_message_for_storage(
         Ok(r) => r,
         Err(e) => {
             eprintln!("{} Failed to unwrap gift wrap {}: {}", "✗".red(), &event.id.to_hex()[..16], e);
-            return None;
+            return Some(ReceivedEvent::Failed {
+                event_id: event.id.to_hex(),
+                error_reason: e.to_string(),
+            });
         }
     };
 
     // Decompress if needed
     let content = decompress_payload(&rumor.content).unwrap_or_else(|_| rumor.content.clone());
 
-    Some(ReceivedCrash {
+    Some(ReceivedEvent::Crash(ReceivedCrash {
         event_id: event.id.to_hex(),
         sender_pubkey: rumor.pubkey.clone(),
         created_at: rumor.created_at as i64,
         content,
-    })
+    }))
 }
 
 // ============================================================================
@@ -671,7 +791,7 @@ async fn listen(
     println!("  Relays: {}", relays.join(", "));
     println!();
 
-    // Connect to all relays concurrently
+    // Connect to all relays concurrently with reconnection
     let mut handles = vec![];
     for relay_url in relays {
         let relay = relay_url.clone();
@@ -679,8 +799,27 @@ async fn listen(
         let format = format.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = subscribe_relay(&relay, &keys, &format).await {
-                eprintln!("{} Relay {} error: {}", "error".red(), relay, e);
+            let mut attempt: u32 = 0;
+            loop {
+                let backoff = {
+                    match subscribe_relay(&relay, &keys, &format).await {
+                        Ok(()) => {
+                            attempt = 0;
+                            None
+                        }
+                        Err(e) => {
+                            let b = backoff_with_jitter(attempt);
+                            eprintln!(
+                                "{} Relay {} error: {} - reconnecting in {:.0}s...",
+                                "error".red(), relay, e, b.as_secs_f64()
+                            );
+                            attempt = attempt.saturating_add(1);
+                            Some(b)
+                        }
+                    }
+                };
+                let delay = backoff.unwrap_or(std::time::Duration::from_secs(1));
+                tokio::time::sleep(delay).await;
             }
         });
         handles.push(handle);
@@ -699,7 +838,7 @@ async fn subscribe_relay(
     keys: &Keys,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
     let (ws_stream, _) = connect_async(relay_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -750,7 +889,7 @@ fn handle_message(
     text: &str,
     keys: &Keys,
     format: &OutputFormat,
-    seen: &mut HashSet<EventId>,
+    seen: &mut BoundedDedup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let msg: Vec<serde_json::Value> = serde_json::from_str(text)?;
 
@@ -794,18 +933,73 @@ struct Rumor {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<Vec<String>>,
-    #[serde(default)]
-    pub sig: String, // Empty for rumors
+    pub sig: Option<String>, // Must be present and empty for rumors (NIP-59)
 }
 
 fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<Rumor, Box<dyn std::error::Error>> {
+    // Verify gift wrap signature (NIP-59: gift wrap is signed by random keypair)
+    gift_wrap.verify()?;
+
     // Decrypt gift wrap to get seal
     let seal_json = nip44::decrypt(keys.secret_key(), &gift_wrap.pubkey, &gift_wrap.content)?;
     let seal: Event = serde_json::from_str(&seal_json)?;
 
+    // Verify seal kind (NIP-59: seal MUST be kind 13)
+    if seal.kind != Kind::Seal {
+        return Err(format!("Invalid seal kind: expected 13, got {}", seal.kind.as_u16()).into());
+    }
+
+    // Verify seal tags are empty (NIP-59: seal tags MUST be empty)
+    if !seal.tags.is_empty() {
+        return Err("Invalid seal: tags must be empty".into());
+    }
+
+    // Verify seal signature (NIP-59: seal is signed by sender)
+    seal.verify()?;
+
     // Decrypt seal to get rumor (unsigned, so parse as Rumor not Event)
     let rumor_json = nip44::decrypt(keys.secret_key(), &seal.pubkey, &seal.content)?;
     let rumor: Rumor = serde_json::from_str(&rumor_json)?;
+
+    // Verify rumor sig is present and empty (NIP-59: rumors are unsigned)
+    match &rumor.sig {
+        Some(s) if s.is_empty() => {} // valid: sig explicitly set to ""
+        Some(s) => return Err(format!("Invalid rumor: sig must be empty, got {} chars", s.len()).into()),
+        None => return Err("Invalid rumor: sig field must be present (as empty string)".into()),
+    }
+
+    // Verify rumor kind is 14 (NIP-17: private direct message)
+    if rumor.kind != 14 {
+        return Err(format!("Invalid rumor kind: expected 14, got {}", rumor.kind).into());
+    }
+
+    // Verify rumor ID matches computed hash (NIP-01: prevents tampering)
+    let serialized = serde_json::to_string(&serde_json::json!([
+        0,
+        rumor.pubkey,
+        rumor.created_at,
+        rumor.kind,
+        rumor.tags,
+        rumor.content,
+    ]))?;
+    let expected_id = hex::encode(sha2::Sha256::digest(serialized.as_bytes()));
+    if rumor.id != expected_id {
+        return Err(format!(
+            "Rumor ID mismatch: claimed {} != computed {}",
+            rumor.id.get(..16).unwrap_or(&rumor.id),
+            expected_id.get(..16).unwrap_or(&expected_id)
+        ).into());
+    }
+
+    // Verify seal.pubkey matches rumor.pubkey (NIP-17: prevent sender spoofing)
+    if seal.pubkey.to_hex() != rumor.pubkey {
+        let seal_hex = seal.pubkey.to_hex();
+        return Err(format!(
+            "Sender spoofing detected: seal.pubkey ({}) != rumor.pubkey ({})",
+            seal_hex.get(..16).unwrap_or(&seal_hex),
+            rumor.pubkey.get(..16).unwrap_or(&rumor.pubkey)
+        ).into());
+    }
 
     Ok(rumor)
 }
@@ -860,4 +1054,226 @@ fn print_pretty(rumor: &Rumor, gift_wrap: &Event) {
     }
 
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::nips::nip44;
+    use nostr::prelude::{Keys, Kind, EventBuilder, Tag};
+    use sha2::Digest;
+
+    /// Wrap a raw rumor JSON in seal + gift wrap, returning the gift wrap Event.
+    fn build_gift_wrap(
+        rumor_json: &str,
+        seal_signer: &Keys,
+        receiver: &Keys,
+    ) -> Event {
+        let wrapper_keys = Keys::generate();
+        let seal_content = nip44::encrypt(
+            seal_signer.secret_key(), &receiver.public_key(), rumor_json, nip44::Version::V2,
+        ).unwrap();
+        let seal = EventBuilder::new(Kind::Seal, &seal_content)
+            .sign_with_keys(seal_signer).unwrap();
+        let seal_json = serde_json::to_string(&seal).unwrap();
+        let gw_content = nip44::encrypt(
+            wrapper_keys.secret_key(), &receiver.public_key(), &seal_json, nip44::Version::V2,
+        ).unwrap();
+        EventBuilder::new(Kind::GiftWrap, &gw_content)
+            .tag(Tag::public_key(receiver.public_key()))
+            .sign_with_keys(&wrapper_keys).unwrap()
+    }
+
+    /// Compute rumor ID per NIP-01: SHA-256 of [0, pubkey, created_at, kind, tags, content].
+    fn compute_rumor_id(pubkey: &str, created_at: u64, kind: u64,
+                        tags: &serde_json::Value, content: &str) -> String {
+        let serialized = serde_json::to_string(
+            &serde_json::json!([0, pubkey, created_at, kind, tags, content])
+        ).unwrap();
+        hex::encode(sha2::Sha256::digest(serialized.as_bytes()))
+    }
+
+    /// Full round-trip: construct gift wrap → unwrap → verify all fields.
+    #[test]
+    fn test_gift_wrap_round_trip() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let content = r##"{"message":"test crash","stack":"#0 Foo.bar (package:app/main.dart:10:3)"}"##;
+        let tags_val = serde_json::json!([["p", receiver.public_key().to_hex()]]);
+        let id = compute_rumor_id(
+            &sender.public_key().to_hex(), 1700000000, 14, &tags_val, content,
+        );
+
+        let rumor = Rumor {
+            id: id.clone(),
+            pubkey: sender.public_key().to_hex(),
+            created_at: 1700000000,
+            kind: 14,
+            content: content.to_string(),
+            tags: vec![vec!["p".to_string(), receiver.public_key().to_hex()]],
+            sig: Some(String::new()),
+        };
+        let rumor_json = serde_json::to_string(&rumor).unwrap();
+
+        let gift_wrap = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let result = unwrap_gift_wrap(&receiver, &gift_wrap);
+        assert!(result.is_ok(), "unwrap failed: {:?}", result.err());
+
+        let unwrapped = result.unwrap();
+        assert_eq!(unwrapped.id, id);
+        assert_eq!(unwrapped.pubkey, sender.public_key().to_hex());
+        assert_eq!(unwrapped.kind, 14);
+        assert_eq!(unwrapped.content, content);
+        assert_eq!(unwrapped.created_at, 1700000000);
+        assert_eq!(unwrapped.sig, Some(String::new()));
+    }
+
+    /// Missing sig field → rejected (NIP-59 requires sig present as "").
+    #[test]
+    fn test_gift_wrap_rejects_missing_sig() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "0".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]],
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("sig field must be present"), "got: {err}");
+    }
+
+    /// Non-empty sig → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_nonempty_sig() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "0".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]],
+            "sig": "deadbeef",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("sig must be empty"), "got: {err}");
+    }
+
+    /// Wrong rumor kind (not 14) → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_wrong_rumor_kind() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let tags_val = serde_json::json!([]);
+        let id = compute_rumor_id(&sender.public_key().to_hex(), 1700000000, 1, &tags_val, "test");
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 1, "content": "test",
+            "tags": [], "sig": "",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("expected 14"), "got: {err}");
+    }
+
+    /// seal.pubkey != rumor.pubkey → rejected (anti-spoofing).
+    #[test]
+    fn test_gift_wrap_rejects_sender_spoofing() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+        let impersonator = Keys::generate();
+
+        let tags_val = serde_json::json!([["p", receiver.public_key().to_hex()]]);
+        let id = compute_rumor_id(
+            &sender.public_key().to_hex(), 1700000000, 14, &tags_val, "spoofed",
+        );
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "spoofed",
+            "tags": [["p", receiver.public_key().to_hex()]], "sig": "",
+        })).unwrap();
+
+        // Seal signed by impersonator, not sender
+        let gw = build_gift_wrap(&rumor_json, &impersonator, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("spoofing"), "got: {err}");
+    }
+
+    /// Tampered rumor ID → rejected.
+    #[test]
+    fn test_gift_wrap_rejects_tampered_id() {
+        let receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        let rumor_json = serde_json::to_string(&serde_json::json!({
+            "id": "a".repeat(64),
+            "pubkey": sender.public_key().to_hex(),
+            "created_at": 1700000000u64, "kind": 14, "content": "test",
+            "tags": [["p", receiver.public_key().to_hex()]], "sig": "",
+        })).unwrap();
+
+        let gw = build_gift_wrap(&rumor_json, &sender, &receiver);
+        let err = unwrap_gift_wrap(&receiver, &gw).unwrap_err().to_string();
+        assert!(err.contains("ID mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_bounded_dedup_basic() {
+        let mut dedup = BoundedDedup::new(3);
+        let id1 = EventId::from_hex(&"a".repeat(64)).unwrap();
+        let id2 = EventId::from_hex(&"b".repeat(64)).unwrap();
+
+        assert!(dedup.insert(id1), "first insert should be new");
+        assert!(!dedup.insert(id1), "duplicate insert should return false");
+        assert!(dedup.contains(&id1));
+        assert!(!dedup.contains(&id2));
+        assert!(dedup.insert(id2), "second id should be new");
+    }
+
+    #[test]
+    fn test_bounded_dedup_eviction() {
+        let mut dedup = BoundedDedup::new(2);
+        let id1 = EventId::from_hex(&"a".repeat(64)).unwrap();
+        let id2 = EventId::from_hex(&"b".repeat(64)).unwrap();
+        let id3 = EventId::from_hex(&"c".repeat(64)).unwrap();
+
+        dedup.insert(id1);
+        dedup.insert(id2);
+        // At capacity — inserting id3 should evict id1
+        dedup.insert(id3);
+
+        assert!(!dedup.contains(&id1), "oldest entry should be evicted");
+        assert!(dedup.contains(&id2));
+        assert!(dedup.contains(&id3));
+    }
+
+    #[test]
+    fn test_backoff_with_jitter() {
+        let d0 = backoff_with_jitter(0);
+        assert!(d0.as_secs() >= BACKOFF_INITIAL_SECS);
+        assert!(d0.as_secs() <= BACKOFF_INITIAL_SECS + 2); // 25% of 5 ≈ 1.25
+
+        let d5 = backoff_with_jitter(5);
+        // 5 * 2^5 = 160, capped at 300; with 25% jitter: 160..200
+        assert!(d5.as_secs() >= 160);
+        assert!(d5.as_secs() <= 200);
+
+        let d10 = backoff_with_jitter(10);
+        // Should be capped at 300 + jitter
+        assert!(d10.as_secs() >= BACKOFF_MAX_SECS);
+        assert!(d10.as_secs() <= BACKOFF_MAX_SECS + BACKOFF_MAX_SECS / 4 + 1);
+    }
 }

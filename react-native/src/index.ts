@@ -130,6 +130,47 @@ function buildPayload(err: unknown, errorInfo?: ErrorInfo): BugstrPayload {
   };
 }
 
+/**
+ * Encrypt and publish a crash report payload to Nostr via NIP-17 gift wrap.
+ *
+ * Builds a kind-14 rumor (unsigned, with `sig: ""`), seals it with NIP-44
+ * encryption (kind 13), then gift-wraps with an ephemeral key (kind 1059)
+ * before publishing to configured relays.
+ *
+ * @param payload - The crash report payload to send. Must conform to
+ *   {@link BugstrPayload} (requires at minimum a non-empty `message`).
+ *   Fields like `stack`, `environment`, `release`, and `platform` are optional.
+ * @returns Resolves when the gift-wrapped event is published to at least one relay.
+ * @throws {Error} If Nostr keys are not configured (call {@link init} first).
+ * @throws {Error} If encryption fails (invalid conversation key or NIP-44 error).
+ * @throws {Error} If publishing fails on all configured relays (network errors,
+ *   relay rejections). The last relay error is re-thrown.
+ *
+ * @remarks
+ * **Side effects:**
+ * - Connects to each relay in sequence until one succeeds, then closes the connection.
+ * - A fresh ephemeral keypair is generated for each gift wrap (no sender correlation).
+ * - Seal and gift wrap use randomized past timestamps for metadata protection.
+ *
+ * **Security:** The `senderPrivkey` (module-level) is used to sign the seal.
+ *   The developer's public key (`developerPubkeyHex`) is the sole decryption target.
+ *   Never log or expose `senderPrivkey`.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await sendToNostr({
+ *     message: 'NullPointerException in onCreate',
+ *     stack: 'at com.example.App.onCreate(App.java:42)',
+ *     timestamp: Date.now(),
+ *     environment: 'production',
+ *     platform: 'react-native',
+ *   });
+ * } catch (err) {
+ *   console.warn('Failed to send crash report:', err);
+ * }
+ * ```
+ */
 async function sendToNostr(payload: BugstrPayload): Promise<void> {
   if (!developerPubkeyHex || !senderPrivkey) {
     throw new Error('Bugstr Nostr keys not configured');
@@ -139,9 +180,10 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
   const plaintext = JSON.stringify(payload);
 
   // Build unsigned kind 14 (rumor)
+  // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
   const rumorEvent: UnsignedEvent = {
     kind: 14,
-    created_at: randomPastTimestamp(),
+    created_at: Math.floor(Date.now() / 1000),
     tags: [['p', developerPubkeyHex]],
     content: plaintext,
     pubkey: getPublicKey(senderPrivkey),

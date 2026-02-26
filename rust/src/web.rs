@@ -1,6 +1,14 @@
 //! Web server for the Bugstr crash report dashboard.
 //!
 //! Provides a REST API and serves an embedded static dashboard.
+//!
+//! # API Contract
+//!
+//! JSON response shapes (GroupJson, CrashJson) are consumed by the frontend
+//! (static/index.html) and potentially external tools. Changing field names
+//! or removing fields is a breaking change.
+//!
+//! Payload schema: test-vectors/sdk-conformance/crash-payload.schema.json
 
 use axum::{
     extract::{Path, State},
@@ -40,6 +48,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/crashes", get(get_crashes))
         .route("/api/crashes/{id}", get(get_crash))
         .route("/api/groups", get(get_groups))
+        .route("/api/groups/{identifier}", get(get_group_crashes))
         .route("/api/stats", get(get_stats))
         .route("/api/symbolicate", post(symbolicate_stack))
         // Static files and SPA fallback
@@ -71,7 +80,7 @@ async fn get_crash(
     }
 }
 
-/// GET /api/groups - Get crash groups by exception type
+/// GET /api/groups - Get crash groups by fingerprint
 async fn get_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let storage = state.storage.lock().await;
     match storage.get_groups(50) {
@@ -80,13 +89,40 @@ async fn get_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// GET /api/groups/:identifier - Get crashes for a specific group.
+/// The identifier can be a fingerprint (v1:...) or a legacy exception type name.
+async fn get_group_crashes(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> impl IntoResponse {
+    let storage = state.storage.lock().await;
+    let result = if identifier.starts_with("v1:") {
+        storage.get_by_fingerprint(&identifier, 200)
+    } else {
+        storage.get_by_exception_type(&identifier, 200)
+    };
+    match result {
+        Ok(crashes) => Json(crashes.into_iter().map(CrashJson::from).collect::<Vec<_>>()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// GET /api/stats - Get dashboard statistics
 async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let storage = state.storage.lock().await;
-    match storage.count() {
-        Ok(total) => Json(StatsJson { total_crashes: total }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    let total = match storage.count() {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let failed = storage.failed_event_count().unwrap_or_else(|e| {
+        eprintln!("failed_event_count query failed: {}", e);
+        0
+    });
+    Json(StatsJson {
+        total_crashes: total,
+        failed_events: failed,
+    })
+    .into_response()
 }
 
 /// POST /api/symbolicate - Symbolicate a stack trace
@@ -191,6 +227,7 @@ struct CrashJson {
     raw_content: String,
     environment: Option<String>,
     release: Option<String>,
+    fingerprint: Option<String>,
 }
 
 impl From<CrashReport> for CrashJson {
@@ -209,27 +246,34 @@ impl From<CrashReport> for CrashJson {
             raw_content: r.raw_content,
             environment: r.environment,
             release: r.release,
+            fingerprint: r.fingerprint,
         }
     }
 }
 
 #[derive(serde::Serialize)]
 struct GroupJson {
+    fingerprint: String,
+    title: String,
     exception_type: String,
     count: i64,
     first_seen: i64,
     last_seen: i64,
     app_versions: Vec<String>,
+    sample_message: Option<String>,
 }
 
 impl From<CrashGroup> for GroupJson {
     fn from(g: CrashGroup) -> Self {
         Self {
+            fingerprint: g.fingerprint,
+            title: g.title,
             exception_type: g.exception_type,
             count: g.count,
             first_seen: g.first_seen,
             last_seen: g.last_seen,
             app_versions: g.app_versions,
+            sample_message: g.sample_message,
         }
     }
 }
@@ -237,6 +281,7 @@ impl From<CrashGroup> for GroupJson {
 #[derive(serde::Serialize)]
 struct StatsJson {
     total_crashes: i64,
+    failed_events: i64,
 }
 
 // Symbolication request/response types

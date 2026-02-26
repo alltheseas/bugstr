@@ -141,6 +141,34 @@ export function clearPendingReports(): void {
   store.set("pendingReports", []);
 }
 
+/**
+ * Encrypt and publish a crash report payload to Nostr via NIP-17 gift wrap.
+ *
+ * Builds a kind-14 rumor (unsigned, with `sig: ""`), seals it with NIP-44
+ * encryption (kind 13), then gift-wraps with an ephemeral key (kind 1059)
+ * before publishing to configured relays.
+ *
+ * @param payload - The crash report to send, conforming to {@link BugstrPayload}.
+ * @returns Resolves when published to at least one relay.
+ * @throws {Error} If Nostr keys are not configured (call {@link init} first).
+ * @throws {Error} If NIP-44 encryption or event signing fails.
+ * @throws {Error} If publishing fails on all configured relays.
+ *
+ * @remarks
+ * - Connects to relays sequentially; returns after the first successful publish.
+ * - A fresh ephemeral keypair signs each gift wrap (no sender correlation).
+ * - Seal and gift wrap use randomized past timestamps for metadata protection.
+ *
+ * @example
+ * ```ts
+ * await sendToNostr({
+ *   message: 'TypeError: Cannot read properties of undefined',
+ *   stack: '    at handleClick (app/components/Button.js:15:3)',
+ *   timestamp: Date.now(),
+ *   environment: 'production',
+ * });
+ * ```
+ */
 async function sendToNostr(payload: BugstrPayload): Promise<void> {
   if (!developerPubkeyHex || !senderPrivkey) {
     throw new Error("Bugstr Nostr keys not configured");
@@ -150,9 +178,10 @@ async function sendToNostr(payload: BugstrPayload): Promise<void> {
   const plaintext = JSON.stringify(payload);
 
   // Build rumor (kind 14, unsigned)
+  // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
   const rumorEvent = {
     kind: 14,
-    created_at: randomPastTimestamp(),
+    created_at: Math.floor(Date.now() / 1000),
     tags: [["p", developerPubkeyHex]],
     content: plaintext,
     pubkey: getPublicKey(senderPrivkey),

@@ -1,0 +1,26 @@
+[package]
+name = "bugstr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bugstr]
+path = ".."
+
+[[bin]]
+name = "fuzz_frame_parser"
+path = "fuzz_targets/fuzz_frame_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_normalize_message"
+path = "fuzz_targets/fuzz_normalize_message.rs"
+test = false
+doc = false

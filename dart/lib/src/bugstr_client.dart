@@ -181,7 +181,8 @@ class Bugstr {
       final content = maybeCompressPayload(plaintext);
 
       // Build rumor (kind 14, unsigned)
-      final rumorCreatedAt = _randomPastTimestamp();
+      // NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
+      final rumorCreatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final rumorTags = [
         ['p', _developerPubkeyHex!]
       ];
@@ -263,7 +264,10 @@ class Bugstr {
   static Future<void> _publishToRelay(String url, Nip01Event event) async {
     final ndk = Ndk.defaultConfig();
     await ndk.relays.connectRelay(url);
-    await ndk.relays.publish(event);
-    await ndk.relays.disconnectRelay(url);
+    try {
+      await ndk.relays.publish(event);
+    } finally {
+      await ndk.relays.disconnectRelay(url);
+    }
   }
 }

@@ -184,6 +184,12 @@
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 8px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .group-item:hover {
+            border-color: var(--text-muted);
         }
 
         .group-info {
@@ -367,6 +373,7 @@
         let crashes = [];
         let groups = [];
         let currentView = 'crashes';
+        let drillDownActive = false;
 
         // Fetch data on load
         async function init() {
@@ -459,7 +466,7 @@
                 content.innerHTML = `
                     <div class="empty-state">
                         <h2>No crash groups</h2>
-                        <p>Crashes will be grouped by exception type.</p>
+                        <p>Crashes will be grouped by stack trace fingerprint.</p>
                     </div>
                 `;
                 return;
@@ -467,10 +474,11 @@
 
             content.innerHTML = `
                 <div class="crash-list">
-                    ${groups.map(group => `
-                        <div class="group-item">
+                    ${groups.map((group, i) => `
+                        <div class="group-item" role="button" tabindex="0" onclick="showGroup(${i})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showGroup(${i})}">
                             <div class="group-info">
-                                <div class="crash-type">${escapeHtml(group.exception_type)}</div>
+                                <div class="crash-type">${escapeHtml(group.title || group.exception_type)}</div>
+                                ${group.sample_message ? `<div class="crash-message">${escapeHtml(group.sample_message)}</div>` : ''}
                                 <div class="crash-meta">
                                     <span>First: ${formatTime(group.first_seen)}</span>
                                     <span>Last: ${formatTime(group.last_seen)}</span>
@@ -488,9 +496,84 @@
             `;
         }
 
+        async function showGroup(index) {
+            const group = groups[index];
+            if (!group) return;
+
+            drillDownActive = true;
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state"><p>Loading...</p></div>';
+
+            // Use fingerprint for drill-down, fall back to exception_type for legacy data
+            const identifier = group.fingerprint || group.exception_type || 'Unknown';
+            const displayTitle = group.title || group.exception_type || 'Unknown';
+
+            try {
+                const res = await fetch(`/api/groups/${encodeURIComponent(identifier)}`);
+                if (!res.ok) {
+                    content.innerHTML = `
+                        <div class="empty-state">
+                            <h2>Failed to load crashes</h2>
+                            <p><a href="#" onclick="event.preventDefault(); drillDownActive=false; currentView='groups'; render();" style="color: var(--accent);">Back to groups</a></p>
+                        </div>
+                    `;
+                    return;
+                }
+                const data = await res.json();
+                const filtered = Array.isArray(data) ? data : [];
+
+                if (filtered.length === 0) {
+                    content.innerHTML = `
+                        <div class="empty-state">
+                            <h2>No crashes for "${escapeHtml(displayTitle)}"</h2>
+                            <p><a href="#" onclick="event.preventDefault(); drillDownActive=false; currentView='groups'; render();" style="color: var(--accent);">Back to groups</a></p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                content.innerHTML = `
+                    <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                        <a href="#" onclick="event.preventDefault(); drillDownActive=false; currentView='groups'; render();" style="color: var(--accent); text-decoration: none;">&larr; Back to groups</a>
+                        <span style="color: var(--text-muted);">|</span>
+                        <span style="color: var(--text-muted);">${escapeHtml(displayTitle)} &mdash; ${filtered.length} crash${filtered.length !== 1 ? 'es' : ''}</span>
+                    </div>
+                    <div class="crash-list">
+                        ${filtered.map(crash => `
+                            <div class="crash-item" tabindex="0" role="button" aria-label="${escapeHtml(crash.exception_type || 'Unknown Error')}: ${escapeHtml(crash.message || 'No message')}" onclick="showCrash(${crash.id})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showCrash(${crash.id})}">
+                                <div class="crash-header">
+                                    <span class="crash-type">${escapeHtml(crash.exception_type || 'Unknown Error')}</span>
+                                    <span class="crash-time">${formatTime(crash.received_at)}</span>
+                                </div>
+                                <div class="crash-message">${escapeHtml(crash.message || 'No message')}</div>
+                                <div class="crash-meta">
+                                    ${crash.environment ? `<span class="badge badge-env">${escapeHtml(crash.environment)}</span>` : ''}
+                                    ${crash.app_version ? `<span class="badge badge-version">v${escapeHtml(crash.app_version)}</span>` : ''}
+                                    ${crash.release ? `<span>Release: ${escapeHtml(crash.release)}</span>` : ''}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <h2>Failed to load crashes</h2>
+                        <p><a href="#" onclick="event.preventDefault(); drillDownActive=false; currentView='groups'; render();" style="color: var(--accent);">Back to groups</a></p>
+                    </div>
+                `;
+            }
+        }
+
         async function showCrash(id) {
-            const crash = crashes.find(c => c.id === id);
-            if (!crash) return;
+            let crash = crashes.find(c => c.id === id);
+            if (!crash) {
+                try {
+                    const res = await fetch(`/api/crashes/${id}`);
+                    if (!res.ok) return;
+                    crash = await res.json();
+                } catch (e) { return; }
+            }
 
             document.getElementById('modal-type').textContent = crash.exception_type || 'Unknown Error';
             document.getElementById('modal-body').innerHTML = `
@@ -572,6 +655,7 @@
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 currentView = tab.dataset.view;
+                drillDownActive = false;
                 render();
             });
         });
@@ -584,10 +668,10 @@
             if (e.target.id === 'modal') closeModal();
         });
 
-        // Auto-refresh every 30 seconds
+        // Auto-refresh every 30 seconds (skip render during drill-down)
         setInterval(async () => {
             await Promise.all([fetchCrashes(), fetchGroups(), fetchStats()]);
-            render();
+            if (!drillDownActive) render();
         }, 30000);
 
         init();

@@ -325,9 +325,10 @@ def _send_to_nostr(payload: Payload) -> None:
         content = _maybe_compress(plaintext)
 
         # Build rumor (kind 14, unsigned)
+        # NIP-59: rumor uses actual timestamp, only seal/gift-wrap are randomized
         rumor = {
             "pubkey": _sender_keys.public_key().to_hex(),
-            "created_at": _random_past_timestamp(),
+            "created_at": int(time.time()),
             "kind": 14,
             "tags": [["p", _developer_pubkey_hex]],
             "content": content,

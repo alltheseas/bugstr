@@ -1,0 +1,116 @@
+{
+  "$schema": "./fingerprint-vectors.schema.json",
+  "version": "1.0.0",
+  "algorithm": "v1",
+  "description": "Fingerprint test vectors generated from Rust reference implementation. All SDKs that compute fingerprints client-side MUST produce identical results. The receiver (Rust) is the authoritative implementation.",
+  "vectors": [
+    {
+      "description": "dart_in_app_frame",
+      "notes": "Only the in-app Dart frame (package:) is used. Flutter framework and dart:async frames are excluded.",
+      "input": {
+        "exception_type": "StateError",
+        "message": "Bad state: no element",
+        "stack_trace": "#0      _AboutSection.build (package:zapstore/screens/profile_screen.dart:123:45)\n#1      StatefulElement.build (package:flutter/src/widgets/framework.dart:5765:27)\n#2      _rootRun (dart:async/zone.dart:1399:13)"
+      },
+      "expected_fingerprint": "v1:51a4d2d9e864c799bb699e82ca34667c",
+      "expected_title": "StateError in build (screens/profile_screen.dart)"
+    },
+    {
+      "description": "dart_different_line_same_fp",
+      "notes": "Same file and method as dart_in_app_frame but different line numbers. MUST produce the SAME fingerprint (line numbers are stripped).",
+      "input": {
+        "exception_type": "StateError",
+        "message": "Bad state: no element",
+        "stack_trace": "#0      _AboutSection.build (package:zapstore/screens/profile_screen.dart:999:10)\n#1      StatefulElement.build (package:flutter/src/widgets/framework.dart:5765:27)\n#2      _rootRun (dart:async/zone.dart:1399:13)"
+      },
+      "expected_fingerprint": "v1:51a4d2d9e864c799bb699e82ca34667c",
+      "expected_title": "StateError in build (screens/profile_screen.dart)"
+    },
+    {
+      "description": "dart_different_method_different_fp",
+      "notes": "Different method and file from dart_in_app_frame. MUST produce a DIFFERENT fingerprint.",
+      "input": {
+        "exception_type": "StateError",
+        "message": "Bad state: no element",
+        "stack_trace": "#0      _SettingsState.initState (package:zapstore/screens/settings_screen.dart:42:5)\n#1      StatefulElement._firstBuild (package:flutter/src/widgets/framework.dart:5555:11)"
+      },
+      "expected_fingerprint": "v1:aabae36f1d05ef3cb14afc294542bdc0",
+      "expected_title": "StateError in initState (screens/settings_screen.dart)"
+    },
+    {
+      "description": "java_in_app_frame",
+      "notes": "Only com.example.myapp.* frame is in-app. android.app.* and java.lang.* are excluded.",
+      "input": {
+        "exception_type": "NullPointerException",
+        "message": "Attempt to invoke virtual method on null reference",
+        "stack_trace": "java.lang.NullPointerException: Attempt to invoke virtual method on null reference\n\tat com.example.myapp.MainActivity.onCreate(MainActivity.java:42)\n\tat android.app.Activity.performCreate(Activity.java:8000)\n\tat java.lang.Thread.run(Thread.java:929)"
+      },
+      "expected_fingerprint": "v1:0f7566a6f37bbdcbac64f05680c4d31e",
+      "expected_title": "NullPointerException in onCreate (MainActivity.java)"
+    },
+    {
+      "description": "js_in_app_frame",
+      "notes": "Only app/components/Button.js frame is in-app. node:internal is excluded.",
+      "input": {
+        "exception_type": "TypeError",
+        "message": "Cannot read properties of undefined",
+        "stack_trace": "TypeError: Cannot read properties of undefined\n    at handleClick (app/components/Button.js:15:3)\n    at processTicksAndRejections (node:internal/process/task_queues:95:5)"
+      },
+      "expected_fingerprint": "v1:11ea41e1d5aac3160edb0f2208adc31b",
+      "expected_title": "TypeError in handleClick (app/components/Button.js)"
+    },
+    {
+      "description": "no_stack_message_only",
+      "notes": "No stack trace. Falls back to normalized message. IPs and timestamps are replaced with placeholders before hashing.",
+      "input": {
+        "exception_type": "Exception",
+        "message": "Connection to 192.168.1.1 failed at 2024-01-15T10:30:00",
+        "stack_trace": null
+      },
+      "expected_fingerprint": "v1:2810fcf265bb4c379f67d2564ba2898c",
+      "expected_title": "Exception: Connection to 192.168.1.1 failed at 2024-01-15T10:30:00"
+    },
+    {
+      "description": "no_stack_message_only_different_ip",
+      "notes": "Same message structure as no_stack_message_only but with different IP and timestamp. MUST produce the SAME fingerprint (variable data is normalized).",
+      "input": {
+        "exception_type": "Exception",
+        "message": "Connection to 10.0.0.1 failed at 2025-06-20T08:15:00",
+        "stack_trace": null
+      },
+      "expected_fingerprint": "v1:2810fcf265bb4c379f67d2564ba2898c",
+      "expected_title": "Exception: Connection to 10.0.0.1 failed at 2025-06-20T08:15:00"
+    },
+    {
+      "description": "no_in_app_frames_fallback",
+      "notes": "Stack trace exists but contains only framework frames (dart:async). Falls back to normalized message.",
+      "input": {
+        "exception_type": "Error",
+        "message": "something broke",
+        "stack_trace": "#0      _rootRun (dart:async/zone.dart:1399:13)\n#1      _CustomZone.run (dart:async/zone.dart:1301:19)"
+      },
+      "expected_fingerprint": "v1:0bdeef95201b478fbc952dabf7e2b21c",
+      "expected_title": "Error: something broke"
+    }
+  ],
+  "assertions": [
+    {
+      "rule": "line_number_invariance",
+      "description": "Vectors 'dart_in_app_frame' and 'dart_different_line_same_fp' MUST have identical fingerprints",
+      "vectors": ["dart_in_app_frame", "dart_different_line_same_fp"],
+      "relation": "equal"
+    },
+    {
+      "rule": "different_stack_different_fp",
+      "description": "Vectors 'dart_in_app_frame' and 'dart_different_method_different_fp' MUST have different fingerprints",
+      "vectors": ["dart_in_app_frame", "dart_different_method_different_fp"],
+      "relation": "not_equal"
+    },
+    {
+      "rule": "message_normalization",
+      "description": "Vectors 'no_stack_message_only' and 'no_stack_message_only_different_ip' MUST have identical fingerprints (IPs and timestamps normalized)",
+      "vectors": ["no_stack_message_only", "no_stack_message_only_different_ip"],
+      "relation": "equal"
+    }
+  ]
+}

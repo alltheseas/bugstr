@@ -1,4 +1,4 @@
-name: NIP-17 Schema Validation
+name: NIP-17/NIP-59 Schema Validation
 
 on:
   push:
@@ -18,10 +18,14 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install dependencies (including @nostrability/schemata)
         working-directory: ./test-vectors
-        run: npm install
+        run: npm install --include=dev
 
       - name: Validate NIP-17 test vectors
         working-directory: ./test-vectors
-        run: npm test
+        run: node validate.js
+
+      - name: Validate against upstream schemata (kind 14, 15, 10050, 13, 1059)
+        working-directory: ./test-vectors
+        run: node validate-schemata.js
