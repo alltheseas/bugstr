@@ -47,6 +47,8 @@ jobs:
             ~/.cargo/git
             rust/target
           key: ${{ runner.os }}-cargo-schema-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-schema-
 
       - name: Run schema validation tests
         working-directory: ./rust

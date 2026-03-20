@@ -185,14 +185,12 @@ fn wrong_kind_fails_validation() {
         "sig": sig128('c')
     });
 
-    // Validate as kind 0 schema — kind mismatch should fail
-    if let Some(schema) = get_schema("kind0Schema") {
-        let result = validate(schema, &note);
-        assert!(
-            !result.valid,
-            "kind 1 note should fail kind 0 schema validation"
-        );
-    }
+    let schema = get_schema("kind0Schema").expect("kind0Schema should exist");
+    let result = validate(schema, &note);
+    assert!(
+        !result.valid,
+        "kind 1 note should fail kind 0 schema validation"
+    );
 }
 
 #[test]
@@ -206,11 +204,10 @@ fn missing_pubkey_fails_validation() {
         "sig": sig128('c')
     });
 
-    if let Some(schema) = get_schema("noteSchema") {
-        let result = validate(schema, &note);
-        assert!(
-            !result.valid,
-            "event missing pubkey should fail validation"
-        );
-    }
+    let schema = get_schema("noteSchema").expect("noteSchema should exist");
+    let result = validate(schema, &note);
+    assert!(
+        !result.valid,
+        "event missing pubkey should fail validation"
+    );
 }
