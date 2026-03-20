@@ -8,6 +8,8 @@ repository = "https://github.com/alltheseas/bugstr"
 keywords = ["nostr", "crash-reporting", "nip-17", "privacy"]
 categories = ["development-tools::debugging"]
 
+[workspace]
+
 [[bin]]
 name = "bugstr"
 path = "src/bin/main.rs"
@@ -48,3 +50,8 @@ tempfile = "3.14"
 semver = "1.0"
 
 [dev-dependencies]
+schemata-validator-rs = { git = "https://github.com/nostrability/schemata-validator-rs.git" }
+schemata-rs = { git = "https://github.com/nostrability/schemata-rs.git" }
+
+[patch."https://github.com/nostrability/schemata-validator-rs.git"]
+schemata-rs = { git = "https://github.com/nostrability/schemata-rs.git" }
